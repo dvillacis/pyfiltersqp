@@ -113,9 +113,8 @@ result2 = solve(problem_v2,
 ## Roadmap
 
 See [`ROADMAP.md`](ROADMAP.md) and [`CHANGELOG.md`](CHANGELOG.md). The next
-real-engineering items are PyPI publish (this commit), Woodbury custom KKT
-solver inside OSQP for the n > 1000 range, and a projected-CG QP path for
-n > 10 000.
+real-engineering items are a Woodbury custom KKT solver inside OSQP for
+the n > 1000 range, and a projected-CG QP path for n > 10 000.
 
 ## References
 
