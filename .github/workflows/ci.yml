@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:     [ ubuntu-latest, macos-latest ]
+        python: [ "3.11", "3.12", "3.13" ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install project (with dev extras)
+        run: uv sync --extra dev
+
+      - name: Run pytest
+        run: uv run pytest tests/ -v
+
+  test-numba:
+    name: pytest with [numba] extra
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install with numba extra
+        run: uv sync --extra dev --extra numba
+
+      - name: Verify numba JIT path is exercised
+        run: |
+          uv run python -c "from pyfiltersqp._lbfgs import _HAS_NUMBA; assert _HAS_NUMBA, 'numba should be installed'; print('numba JIT enabled')"
+          uv run pytest tests/ -v
+
+  build:
+    name: Build wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Verify wheel installs and imports
+        run: |
+          uv venv .venv-check
+          uv pip install --python .venv-check/bin/python dist/*.whl
+          .venv-check/bin/python -c "import pyfiltersqp; print('pyfiltersqp', pyfiltersqp.__version__)"
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

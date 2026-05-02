@@ -1,0 +1,97 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyfiltersqp"
+version = "0.3.0"
+description = "Open-source SQP solver with L-BFGS Hessian, filter line search, and first-class warm-starting"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "David Villacis", email = "david@villacis.net" },
+]
+keywords = [
+    "optimization",
+    "nonlinear programming",
+    "nlp",
+    "sqp",
+    "sequential quadratic programming",
+    "l-bfgs",
+    "filter line search",
+    "warm-start",
+    "constrained optimization",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "osqp>=0.6",
+]
+
+[project.urls]
+Homepage      = "https://github.com/davidvillacis/pyfiltersqp"
+Repository    = "https://github.com/davidvillacis/pyfiltersqp"
+Issues        = "https://github.com/davidvillacis/pyfiltersqp/issues"
+Changelog     = "https://github.com/davidvillacis/pyfiltersqp/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# Test dependencies for `uv sync --extra dev` / `pip install pyfiltersqp[dev]`.
+dev = [
+    "pytest>=7",
+    "pytest-xdist",
+]
+# Optional JIT acceleration of the L-BFGS forward recursion.
+# Install with: pip install "pyfiltersqp[numba]"
+# When installed, _lbfgs._precompute_Bs runs as a compiled kernel and the
+# inner Python loop overhead disappears.  See _lbfgs._precompute_Bs_jit.
+numba = [
+    "numba>=0.59",
+]
+# CUTEst benchmark harness (scripts/bench_cutest.py).  Requires CUTEst,
+# SIFDecode, and ARCHDefs installed separately — see the bench script docs.
+cutest = [
+    "pycutest>=1.8.2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyfiltersqp"]
+
+[tool.hatch.build.targets.sdist]
+# Ship enough for source builds and license auditing; exclude developer
+# scratch (CLAUDE.md, the local pympcc clone, and the uv lockfile which
+# only matters for development).
+include = [
+    "src/pyfiltersqp",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "DESIGN.md",
+    "ROADMAP.md",
+    "pyproject.toml",
+]
+exclude = [
+    "CLAUDE.md",
+    "uv.lock",
+    "scripts",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
