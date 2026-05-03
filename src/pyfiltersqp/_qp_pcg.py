@@ -500,6 +500,10 @@ class ProjectedCGQP:
         # set has genuinely overcommitted.
         _OVERCAP_K          = 3
         _overcap_window     = _deque(maxlen=_OVERCAP_K)
+        # Fast-fire over-commit detector under bland mode (see KKTSparseQP
+        # for the full rationale; same logic mirrored here).
+        _BLAND_OVERCAP_FAST_K = 10
+        _bland_overcap_count = 0
 
         for _ in range(self.max_as_iter):
             key = (frozenset(active_lb), frozenset(active_ub),
@@ -534,18 +538,43 @@ class ProjectedCGQP:
             # Watchdog: count consecutive bland iters where m_act sits in
             # a small set.  Reset the window whenever bland flips back off.
             if bland:
+                # Fast over-commit detector (10 consecutive iters >n).
+                if m_act_now > n:
+                    _bland_overcap_count += 1
+                    if _bland_overcap_count >= _BLAND_OVERCAP_FAST_K:
+                        if _DBG:
+                            print(
+                                f"[PCG] WATCHDOG  fast over-commit: "
+                                f"m_act={m_act_now} > n={n} for "
+                                f"{_BLAND_OVERCAP_FAST_K} consecutive bland "
+                                f"iters; exit with best-effort p",
+                                flush=True, file=_sys.stderr,
+                            )
+                        break
+                else:
+                    _bland_overcap_count = 0
+
                 _bland_window.append(m_act_now)
-                if (len(_bland_window) == _BLAND_K
-                        and (max(_bland_window) - min(_bland_window))
-                        <= _BLAND_AMPLITUDE):
-                    if _DBG:
-                        print(
-                            f"[PCG] WATCHDOG  m_act in [{min(_bland_window)}, "
-                            f"{max(_bland_window)}] for {_BLAND_K} bland iters; "
-                            f"exit AS loop with best-effort p",
-                            flush=True, file=_sys.stderr,
-                        )
-                    break
+                if len(_bland_window) == _BLAND_K:
+                    win_min = min(_bland_window)
+                    win_max = max(_bland_window)
+                    amp = win_max - win_min
+                    # Two exit conditions: small-amplitude oscillation
+                    # (Bland-degenerate cycle) OR persistent over-commit
+                    # (m_act > n throughout the window — rank-deficient
+                    # solve perturbs inactive constraints each iter so
+                    # single-pivot adds find "new" violations forever).
+                    if amp <= _BLAND_AMPLITUDE or win_min > n:
+                        if _DBG:
+                            reason = ("oscillation" if amp <= _BLAND_AMPLITUDE
+                                      else "over-commit")
+                            print(
+                                f"[PCG] WATCHDOG  {reason}: m_act in "
+                                f"[{win_min}, {win_max}] for {_BLAND_K} "
+                                f"bland iters (n={n}); exit with best-effort p",
+                                flush=True, file=_sys.stderr,
+                            )
+                        break
             elif _bland_window:
                 _bland_window.clear()
 
@@ -785,10 +814,18 @@ class ProjectedCGQP:
         self._active_ub_soc   = list(active_ub)
 
         if self.warm_start:
-            self._warm_active_ineq = list(active_ineq)
-            self._warm_active_lb   = list(active_lb)
-            self._warm_active_ub   = list(active_ub)
-            self._warm_init = True
+            # Don't save over-committed state (see KKTSparseQP for full
+            # rationale).  When the current solve ended with m_act > n
+            # the watchdog likely fired; cold-start next time.
+            m_act_final = (m_eq + len(active_ineq)
+                           + len(active_lb) + len(active_ub))
+            if m_act_final <= n:
+                self._warm_active_ineq = list(active_ineq)
+                self._warm_active_lb   = list(active_lb)
+                self._warm_active_ub   = list(active_ub)
+                self._warm_init = True
+            else:
+                self._warm_init = False
 
         return p, lam_eq, lam_ineq, lam_lb, lam_ub, True
 

@@ -244,7 +244,17 @@ class KKTSparseQP:
         n = self.n
         m_act = A_act.shape[0]
         delta = self.delta_reg
-        dual_reg = False     # try unregularised (2,2)=0 first
+        # Pre-emptive dual regularisation when over-committed.  SuperLU's
+        # internal pivoting can hit invalid BLAS calls (cblas_dtrsv,
+        # cblas_dgemv) on rank-deficient saddle-point matrices — these
+        # *print to stderr but do not raise Python exceptions*, so our
+        # try/except can't catch them and the resulting lu factor is
+        # silently corrupted.  When m_act > n the system is provably
+        # rank-deficient, so we skip the unbiased attempt and go straight
+        # to (2,2) = -δI which makes the matrix non-singular by
+        # construction.  Bias on λ is δ·|λ| ~ 1e-8·|λ|; harmless for the
+        # SQP outer line search.
+        dual_reg = (m_act > n)
 
         for _ in range(20):  # at most 20 attempts; covers 1e-8 → 1e+4
             sigma_eff = sigma + delta
@@ -424,6 +434,16 @@ class KKTSparseQP:
         _bland_window     = deque(maxlen=_BLAND_K)
         _OVERCAP_K        = 3
         _overcap_window   = deque(maxlen=_OVERCAP_K)
+        # Fast-fire over-commit detector: once we're in bland mode AND
+        # m_act > n, count consecutive iters.  At m_act > n the augmented
+        # KKT is rank-deficient by counting alone, single-pivot adds
+        # find new "violations" each iter from the regularised solve's
+        # residuals, and SuperLU's internal panel routines can hit
+        # invalid BLAS calls if we let m_act drift further.  K_FAST=10
+        # is small enough to dodge the BLAS landmine but large enough
+        # not to false-trip on transient overshoots.
+        _BLAND_OVERCAP_FAST_K = 10
+        _bland_overcap_count = 0
 
         # Cached factor + Woodbury overlay state (latest valid solve)
         last_lu     = None
@@ -457,18 +477,47 @@ class KKTSparseQP:
                     )
 
             if bland:
+                # Fast over-commit detector (10 consecutive iters >n).
+                if m_act_now > n:
+                    _bland_overcap_count += 1
+                    if _bland_overcap_count >= _BLAND_OVERCAP_FAST_K:
+                        if _DBG:
+                            print(
+                                f"[KKT] WATCHDOG  fast over-commit: "
+                                f"m_act={m_act_now} > n={n} for "
+                                f"{_BLAND_OVERCAP_FAST_K} consecutive bland "
+                                f"iters; exit with best-effort p",
+                                flush=True, file=_sys.stderr,
+                            )
+                        break
+                else:
+                    _bland_overcap_count = 0
+
                 _bland_window.append(m_act_now)
-                if (len(_bland_window) == _BLAND_K
-                        and (max(_bland_window) - min(_bland_window))
-                        <= _BLAND_AMPLITUDE):
-                    if _DBG:
-                        print(
-                            f"[KKT] WATCHDOG  m_act in [{min(_bland_window)}, "
-                            f"{max(_bland_window)}] for {_BLAND_K} bland iters; "
-                            f"exit AS loop with best-effort p",
-                            flush=True, file=_sys.stderr,
-                        )
-                    break
+                if len(_bland_window) == _BLAND_K:
+                    win_min = min(_bland_window)
+                    win_max = max(_bland_window)
+                    amp = win_max - win_min
+                    # Two exit conditions:
+                    # 1. Small-amplitude oscillation: m_act flip-flops in a
+                    #    narrow band (the classic Bland-degenerate cycle).
+                    # 2. Persistent over-commit: m_act has stayed above n
+                    #    for the entire window — single-pivot adds keep
+                    #    finding "new" violations because the rank-
+                    #    deficient KKT solve perturbs inactive constraints
+                    #    into apparent violation each iter, and we'd grow
+                    #    m_act forever otherwise.
+                    if amp <= _BLAND_AMPLITUDE or win_min > n:
+                        if _DBG:
+                            reason = ("oscillation" if amp <= _BLAND_AMPLITUDE
+                                      else "over-commit")
+                            print(
+                                f"[KKT] WATCHDOG  {reason}: m_act in "
+                                f"[{win_min}, {win_max}] for {_BLAND_K} "
+                                f"bland iters (n={n}); exit with best-effort p",
+                                flush=True, file=_sys.stderr,
+                            )
+                        break
             elif _bland_window:
                 _bland_window.clear()
 
@@ -737,10 +786,29 @@ class KKTSparseQP:
         self._active_ub_soc   = list(active_ub)
 
         if self.warm_start:
-            self._warm_active_ineq = list(active_ineq)
-            self._warm_active_lb   = list(active_lb)
-            self._warm_active_ub   = list(active_ub)
-            self._warm_init = True
+            # Only save warm state when m_act is *not* over-committed.
+            # Inheriting an over-committed active set into the next QP
+            # poisons it: the new solve starts at m_act > n, FORCE-BLAND
+            # fires, the fast over-commit watchdog needs ≥10 bland iters
+            # to trigger, and SuperLU's internal BLAS panel can fail
+            # before the watchdog gets there.  When the current solve
+            # ended over-committed (likely the watchdog itself fired),
+            # clear warm state so the next call cold-starts.
+            m_act_final = (m_eq + len(active_ineq)
+                           + len(active_lb) + len(active_ub))
+            if m_act_final <= n:
+                self._warm_active_ineq = list(active_ineq)
+                self._warm_active_lb   = list(active_lb)
+                self._warm_active_ub   = list(active_ub)
+                self._warm_init = True
+            else:
+                if _DBG:
+                    print(
+                        f"[KKT] warm save SKIPPED: m_act_final={m_act_final} > "
+                        f"n={n}; next solve cold-starts",
+                        flush=True, file=_sys.stderr,
+                    )
+                self._warm_init = False
 
         return p, lam_eq, lam_ineq, lam_lb, lam_ub, True
 

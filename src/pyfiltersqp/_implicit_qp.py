@@ -420,6 +420,8 @@ class ImplicitLBFGSQP:
         _bland_window     = _deque(maxlen=_BLAND_K)
         _OVERCAP_K        = 3
         _overcap_window   = _deque(maxlen=_OVERCAP_K)
+        _BLAND_OVERCAP_FAST_K = 10
+        _bland_overcap_count = 0
 
         for _ in range(self.max_as_iter):
             # Hash the active set; if seen before, we've started cycling and
@@ -443,13 +445,24 @@ class ImplicitLBFGSQP:
                 bland = True
 
             if bland:
+                if m_act_now > n:
+                    _bland_overcap_count += 1
+                    if _bland_overcap_count >= _BLAND_OVERCAP_FAST_K:
+                        break  # fast over-commit exit
+                else:
+                    _bland_overcap_count = 0
+
                 _bland_window.append(m_act_now)
-                if (len(_bland_window) == _BLAND_K
-                        and (max(_bland_window) - min(_bland_window))
-                        <= _BLAND_AMPLITUDE):
-                    break  # cycle: exit with current iterate
+                if len(_bland_window) == _BLAND_K:
+                    win_min = min(_bland_window)
+                    amp = max(_bland_window) - win_min
+                    # Cycle (small-amp oscillation) OR over-commit (m_act
+                    # stuck above n).  See ProjectedCGQP for full rationale.
+                    if amp <= _BLAND_AMPLITUDE or win_min > n:
+                        break
             elif _bland_window:
                 _bland_window.clear()
+                _bland_overcap_count = 0
 
             A_act, b_act = self._build(
                 c_eq, J_eq, c_ineq, J_ineq, lb, ub,
@@ -692,11 +705,18 @@ class ImplicitLBFGSQP:
 
         # Stash for the next solve()'s warm-start.  Indices refer to
         # fixed problem rows so they remain valid across SQP iterations.
+        # Skip the save when the current solve ended over-committed
+        # (m_act > n) — see KKTSparseQP for full rationale.
         if self.warm_start:
-            self._warm_active_ineq = list(active_ineq)
-            self._warm_active_lb   = list(active_lb)
-            self._warm_active_ub   = list(active_ub)
-            self._warm_init = True
+            m_act_final = (m_eq + len(active_ineq)
+                           + len(active_lb) + len(active_ub))
+            if m_act_final <= n:
+                self._warm_active_ineq = list(active_ineq)
+                self._warm_active_lb   = list(active_lb)
+                self._warm_active_ub   = list(active_ub)
+                self._warm_init = True
+            else:
+                self._warm_init = False
 
         return p, lam_eq, lam_ineq, lam_lb, lam_ub, True
 
