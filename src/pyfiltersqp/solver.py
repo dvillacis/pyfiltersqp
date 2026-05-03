@@ -52,6 +52,19 @@ class SQPSolver:
         (TV-MCP-class problems where rank-deficient KKT solves leave a
         residual the merit can't penalize away).  HS-suite problems
         never approach this cap.
+    step_max : float or None
+        Optional cap on ``‖p‖∞`` for the QP step (default ``None``,
+        unbounded).  When set, any step larger than the cap is scaled
+        down uniformly before the line search.  Acts as a crude
+        trust-region surrogate: the L-BFGS Hessian on
+        rank-deficient/over-committed active sets sometimes returns
+        wildly oversized steps (TV-MCP saw ``‖p‖`` of 1700+ at iters
+        where useful steps were ``≤ 50``).  Clipping bounds the damage
+        the line search has to claw back, and lets multiple consecutive
+        small-α iters accumulate curvature instead of repeatedly
+        triggering the L-BFGS reset watchdog.  Recommended for the
+        ``kkt`` backend on equality-saturated problems; HS suite
+        unaffected when left ``None``.
     rho : float
         Line search backtracking factor (default 0.5).
     eta : float
@@ -108,6 +121,7 @@ class SQPSolver:
         lbfgs_memory: int   = 10,
         mu0:          float = 1.0,
         mu_max:       float = 1e10,
+        step_max:     float | None = None,
         rho:          float = 0.5,
         eta:          float = 1e-4,
         verbose:      bool  = False,
@@ -128,6 +142,7 @@ class SQPSolver:
         self.lbfgs_memory    = lbfgs_memory
         self.mu0             = mu0
         self.mu_max          = mu_max
+        self.step_max        = step_max
         self.rho             = rho
         self.eta             = eta
         self.verbose         = verbose
@@ -393,6 +408,27 @@ class SQPSolver:
                 step, lam_eq_new, lam_ineq_new, lam_lb_new, lam_ub_new, qp_ok = qp.solve(
                     B, g, c_eq, J_eq, c_ineq, J_ineq, x, p.xl, p.xu
                 )
+
+            # Step-size cap (trust-region surrogate).  When the QP
+            # returns an oversized step — common when the L-BFGS Hessian
+            # is essentially σI on a rank-deficient/over-committed active
+            # set — uniformly scale it down to ‖p‖∞ ≤ step_max.  Multipliers
+            # are left unscaled (they still represent the active-set
+            # KKT solution); the line search will explore α·step, so any
+            # KKT-quality scaling is handled there.
+            if qp_ok and self.step_max is not None:
+                step_inf = float(np.max(np.abs(step))) if step.size > 0 else 0.0
+                if step_inf > self.step_max:
+                    scale = self.step_max / step_inf
+                    step = step * scale
+                    if __import__("os").environ.get("PYFILTERSQP_DEBUG"):
+                        import sys as _sys
+                        print(
+                            f"[PYFSQP] STEP-CAP  iter={k}  "
+                            f"|p|_inf {step_inf:.2e} → {self.step_max:.2e}  "
+                            f"(scale={scale:.2e})",
+                            flush=True, file=_sys.stderr,
+                        )
 
             if not qp_ok:
                 if use_filter_local:
