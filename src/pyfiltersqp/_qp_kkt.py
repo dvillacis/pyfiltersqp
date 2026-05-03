@@ -130,6 +130,23 @@ class KKTSparseQP:
         Relative tolerance for rank determination (default 1e-10).
         Row pivots with ``|R[i,i]| ≤ rank_tol · |R[0,0]|`` are
         considered redundant.
+    inertia_check : bool
+        After each Woodbury-overlay solve, verify the resulting step
+        ``p`` satisfies the descent-curvature condition
+        ``pᵀ(B + δI)p > 0`` (default ``True``).  When violated, the
+        L-BFGS Hessian is non-convex along ``p`` (typical when
+        accumulated y-vectors include non-descent steps from a
+        watchdog regime), so the QP step is *not* a descent direction
+        regardless of merit choice.  The check bumps ``δ_p`` by 10×
+        and re-solves until either the condition holds or
+        ``δ_p > delta_reg_max``.  This is a directional surrogate
+        for IPOPT-style inertia control (which needs symmetric LDLᵀ
+        with Bunch-Kaufman pivoting; scipy.sparse provides only LU).
+    inertia_curvature_tol : float
+        Tolerance for the curvature check (default 1e-10).  Step
+        ``p`` is accepted when ``pᵀBp ≥ -inertia_curvature_tol·‖p‖²``,
+        i.e. ``B`` may be slightly indefinite along ``p`` but bounded
+        below by the existing primal regularisation.
     """
 
     def __init__(
@@ -147,6 +164,8 @@ class KKTSparseQP:
         warm_start: bool = True,
         rank_filter: bool = True,
         rank_tol: float = 1e-10,
+        inertia_check: bool = True,
+        inertia_curvature_tol: float = 1e-10,
     ):
         self.n = n
         self.m_eq = m_eq
@@ -161,6 +180,8 @@ class KKTSparseQP:
         self.warm_start = warm_start
         self.rank_filter = rank_filter
         self.rank_tol = rank_tol
+        self.inertia_check = inertia_check
+        self.inertia_curvature_tol = inertia_curvature_tol
 
         # SOC cache: factor + Woodbury overlay reused for the SOC RHS
         self._lbfgs:  LBFGSMemory | None = None
@@ -291,7 +312,8 @@ class KKTSparseQP:
     # Sparse LU + Woodbury overlay
     # ------------------------------------------------------------------
 
-    def _factor_kkt(self, sigma: float, A_act, force_dual_reg: bool = False):
+    def _factor_kkt(self, sigma: float, A_act, force_dual_reg: bool = False,
+                    delta_init: float | None = None):
         """Build and factor
 
             M_base = [ (σ+δ_p) I   A_actᵀ ]
@@ -336,7 +358,7 @@ class KKTSparseQP:
         """
         n = self.n
         m_act = A_act.shape[0]
-        delta = self.delta_reg
+        delta = self.delta_reg if delta_init is None else delta_init
         # Pre-emptive dual regularisation when over-committed (see above).
         # Pre-emptive dual regularisation: directly when m_act > n (the
         # system is rank-deficient by counting), or when the caller flags
@@ -695,22 +717,67 @@ class KKTSparseQP:
             # makes the matrix non-singular by construction.
             force_dr = (basis_idx is not None
                         and A_red.shape[0] >= n)
-            lu, delta = self._factor_kkt(sigma, A_red,
-                                         force_dual_reg=force_dr)
 
-            if lu is None:
-                # Numerically singular at maximum delta.  Bail.
+            # Inertia-aware factor + curvature-check loop.  If the
+            # post-Woodbury step ``p`` has negative curvature against
+            # the L-BFGS Hessian (``pᵀBp ≤ -tol·‖p‖²``), the model is
+            # indefinite along ``p`` and the step is not a descent
+            # direction regardless of merit choice.  Bump δ_p by 10×
+            # and re-factor.  Cap retries; on cap, accept the step
+            # anyway (best effort) to keep the AS loop alive.  This
+            # is a directional surrogate for IPOPT-style symmetric-LDLᵀ
+            # inertia control (scipy.sparse provides only LU).
+            _inertia_delta_start = self.delta_reg
+            _MAX_INERTIA_BUMPS   = 8
+            for _inertia_attempt in range(_MAX_INERTIA_BUMPS + 1):
+                lu, delta = self._factor_kkt(
+                    sigma, A_red,
+                    force_dual_reg=force_dr,
+                    delta_init=_inertia_delta_start,
+                )
+
+                if lu is None:
+                    if _DBG:
+                        print(
+                            f"[KKT] FACTOR-FAIL  delta={delta:.1e} > max; "
+                            f"returning best-effort p so far",
+                            flush=True, file=_sys.stderr,
+                        )
+                    return (p, lam_eq, lam_ineq, lam_lb, lam_ub, False)
+
+                p, lam_red, U, S = self._solve_with_woodbury(
+                    lu, sigma, delta, A_red, W, d, -g, b_red,
+                )
+
+                if (not self.inertia_check
+                        or _inertia_attempt >= _MAX_INERTIA_BUMPS):
+                    break
+
+                p_norm2 = float(p @ p) if p.size > 0 else 0.0
+                if p_norm2 < 1e-30:
+                    break  # near-zero step; curvature undefined
+                pBp = float(p @ lbfgs.matvec(p))
+                # Descent-curvature condition: pᵀBp ≥ -tol·‖p‖²
+                if pBp >= -self.inertia_curvature_tol * p_norm2:
+                    break  # OK — convex (or near-convex) along p
+
+                # Negative curvature detected: bump δ and refactor.
+                _inertia_delta_start = max(_inertia_delta_start * 10.0, 1e-10)
                 if _DBG:
                     print(
-                        f"[KKT] FACTOR-FAIL  delta={delta:.1e} > max; "
-                        f"returning best-effort p so far",
+                        f"[KKT] INERTIA-BUMP  iter={_as_iter_count[0]+1}  "
+                        f"pᵀBp/‖p‖² = {pBp/p_norm2:.2e}  "
+                        f"δ_p → {_inertia_delta_start:.1e}",
                         flush=True, file=_sys.stderr,
                     )
-                return (p, lam_eq, lam_ineq, lam_lb, lam_ub, False)
-
-            p, lam_red, U, S = self._solve_with_woodbury(
-                lu, sigma, delta, A_red, W, d, -g, b_red,
-            )
+                if _inertia_delta_start > self.delta_reg_max:
+                    if _DBG:
+                        print(
+                            f"[KKT] INERTIA-CAP  δ_p exceeded delta_reg_max; "
+                            f"accept best-effort step",
+                            flush=True, file=_sys.stderr,
+                        )
+                    break
 
             # Map reduced multipliers back to the full active-set vector.
             # Dropped (redundant) rows get λ = 0.

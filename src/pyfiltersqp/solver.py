@@ -162,6 +162,7 @@ class SQPSolver:
         mu_max:       float = 1e10,
         step_max:     float | None = None,
         rank_filter:  bool  = True,
+        inertia_check: bool = True,
         trust_region: bool  = False,
         tr_delta0:    float = 10.0,
         tr_delta_min: float = 1e-8,
@@ -192,6 +193,7 @@ class SQPSolver:
         self.mu_max          = mu_max
         self.step_max        = step_max
         self.rank_filter     = rank_filter
+        self.inertia_check   = inertia_check
         self.trust_region    = trust_region
         self.tr_delta0       = tr_delta0
         self.tr_delta_min    = tr_delta_min
@@ -364,7 +366,7 @@ class SQPSolver:
         elif backend == "pcg":
             qp = ProjectedCGQP(n, m_eq, m_ineq)
         elif backend == "kkt":
-            qp = KKTSparseQP(n, m_eq, m_ineq, rank_filter=self.rank_filter)
+            qp = KKTSparseQP(n, m_eq, m_ineq, rank_filter=self.rank_filter, inertia_check=self.inertia_check)
         else:
             qp = QPSubproblem(n, m_eq, m_ineq, self.osqp_options)
         mu    = self.mu0
@@ -886,7 +888,7 @@ class SQPSolver:
         elif backend == "pcg":
             qp = ProjectedCGQP(n, m_eq, m_ineq)
         elif backend == "kkt":
-            qp = KKTSparseQP(n, m_eq, m_ineq, rank_filter=self.rank_filter)
+            qp = KKTSparseQP(n, m_eq, m_ineq, rank_filter=self.rank_filter, inertia_check=self.inertia_check)
         else:
             qp = QPSubproblem(n, m_eq, m_ineq, self.osqp_options)
 
