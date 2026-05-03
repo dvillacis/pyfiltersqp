@@ -42,6 +42,16 @@ class SQPSolver:
         Number of (s, y) pairs retained in L-BFGS (default 10).
     mu0 : float
         Initial l₁ merit penalty parameter (default 1.0).
+    mu_max : float
+        Cap on the l₁ merit penalty parameter (default 1e10).  When the
+        descent-direction condition asks for ``μ > mu_max``, ``μ`` is
+        clamped at the cap and the armijo line search will fail (the
+        directional derivative is no longer guaranteed negative).  The
+        existing filter-fallback path then engages automatically — the
+        intended escape when the merit framework can't make progress
+        (TV-MCP-class problems where rank-deficient KKT solves leave a
+        residual the merit can't penalize away).  HS-suite problems
+        never approach this cap.
     rho : float
         Line search backtracking factor (default 0.5).
     eta : float
@@ -97,6 +107,7 @@ class SQPSolver:
         max_ls_iter:  int   = 30,
         lbfgs_memory: int   = 10,
         mu0:          float = 1.0,
+        mu_max:       float = 1e10,
         rho:          float = 0.5,
         eta:          float = 1e-4,
         verbose:      bool  = False,
@@ -116,6 +127,7 @@ class SQPSolver:
         self.max_ls_iter     = max_ls_iter
         self.lbfgs_memory    = lbfgs_memory
         self.mu0             = mu0
+        self.mu_max          = mu_max
         self.rho             = rho
         self.eta             = eta
         self.verbose         = verbose
@@ -529,7 +541,8 @@ class SQPSolver:
 
             else:
                 # ---- l₁ merit line search (v0.1 path AND feasible filter iterates) ----
-                mu    = update_penalty(g, step, B, c_eq, c_ineq, mu)
+                mu    = update_penalty(g, step, B, c_eq, c_ineq, mu,
+                                       mu_max=self.mu_max)
                 D_phi = directional_deriv(g, step, c_eq, c_ineq, mu)
                 alpha, _, c_eq_new, c_ineq_new = armijo_backtrack(
                     x, step, f, c_eq, c_ineq, D_phi, mu,
@@ -594,6 +607,16 @@ class SQPSolver:
                             filt.add(f, h_curr)
 
                 if alpha <= 1e-10:
+                    if __import__("os").environ.get("PYFILTERSQP_DEBUG"):
+                        import sys as _sys
+                        h_now = constraint_violation(c_eq, c_ineq)
+                        print(
+                            f"[PYFSQP] LINE-SEARCH-FAIL  iter={k}  "
+                            f"l1+SOC+filter all refused  alpha<=1e-10  "
+                            f"|step|={float(np.linalg.norm(step)):.2e}  "
+                            f"f={f:.4e}  h={h_now:.2e}  mu={mu:.2e}",
+                            flush=True, file=_sys.stderr,
+                        )
                     return self._make_result(x, f, lam_eq_new, lam_ineq_new,
                                              lam_lb_new, lam_ub_new, p, 2, k, history)
 
@@ -620,10 +643,15 @@ class SQPSolver:
             else:
                 tiny_alpha_count = 0
 
-            if self.verbose:
+            # Env-var-triggered per-iter debug (mirror of verbose=True).
+            # Useful when verbose isn't forwarded through multi-layer
+            # adapters (e.g. pympcc → _filtersqp_adapter → SQPSolver).
+            if (self.verbose
+                    or __import__("os").environ.get("PYFILTERSQP_DEBUG")):
                 kkt_new = kkt_residuals(g_new, c_eq_new, c_ineq_new,
                                         J_eq_new, J_ineq_new, lam_eq_new, lam_ineq_new,
                                         lam_lb_new, lam_ub_new)
+            if self.verbose:
                 history.append(IterationInfo(
                     iteration=k,
                     obj=f_new,
@@ -635,6 +663,8 @@ class SQPSolver:
                     step_size=alpha,
                     qp_iters=0,   # TODO: extract from OSQP result
                 ))
+            if (self.verbose
+                    or __import__("os").environ.get("PYFILTERSQP_DEBUG")):
                 import sys
                 print(
                     f"  pyfsqp iter={k:4d}  obj={f_new:+.4e}  "

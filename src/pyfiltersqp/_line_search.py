@@ -60,6 +60,7 @@ def update_penalty(
     c_ineq: np.ndarray,
     mu: float,
     sigma: float = 0.01,
+    mu_max: float | None = None,
 ) -> float:
     """
     Increase the penalty parameter μ if needed so that p is a descent direction.
@@ -75,6 +76,15 @@ def update_penalty(
     B : ndarray or callable
         Dense Hessian matrix OR a callable ``B(v)`` that returns ``B @ v``.
         The callable form avoids materialising the dense matrix.
+    mu_max : float or None
+        Optional upper bound on μ.  When set, μ is clamped to this value
+        even if the descent-direction condition asks for more.  At the
+        cap the directional derivative ``D_φ = gᵀp − μ·h`` is no longer
+        guaranteed negative, so ``armijo_backtrack`` will fail and the
+        outer SQP's filter-fallback path engages — the right escape when
+        the merit framework can't make progress (TV-MCP-class problems
+        where rank-deficient regularised solves leave a residual h that
+        the SQP step can't drive to zero).  Default ``None`` = uncapped.
 
     Returns the (possibly updated) μ.
     """
@@ -91,6 +101,8 @@ def update_penalty(
 
     if mu < threshold:
         mu = threshold * 1.1   # inflate by 10 %
+    if mu_max is not None and mu > mu_max:
+        mu = mu_max
     return mu
 
 

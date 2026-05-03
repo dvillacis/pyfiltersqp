@@ -89,12 +89,24 @@ class KKTSparseQP:
     max_as_iter : int or None
         Active-set iteration cap.  Default: ``2 n + m_eq + m_ineq + 20``.
     delta_reg : float
-        Tikhonov shift on the (1,1) block of ``M_base`` (default 1e-8).
-        Grows on splu numerical failure (capped at ``delta_reg_max``).
+        Tikhonov shift on the (1,1) primal block of ``M_base`` (default
+        1e-8).  Grows on splu numerical failure (capped at
+        ``delta_reg_max``).
     delta_reg_max : float
         Upper bound on the Tikhonov shift.  ``solve()`` returns
         ``success=False`` if delta climbs above this threshold without
         producing a usable factorisation.
+    dual_reg_ratio : float
+        Ratio ``δ_d / δ_p`` for the (2,2) dual-block shift (default
+        ``1e-4``).  The (2,2) shift biases the constraint residual by
+        ``δ_d · |λ|``, so when |λ| is large (TV-MCP-class problems
+        routinely see |λ| ~ 1e7 from over-committed active sets), a
+        full ``δ_d = δ_p = 1e-8`` injects a residual of magnitude 1.0
+        into the constraint equations — enough to forbid the SQP outer
+        loop from ever driving the constraint violation below ~1.0.
+        Setting ``δ_d = 1e-12`` (i.e. ratio 1e-4) drops the bias to
+        ~1e-4 even at |λ| = 1e8, freeing the merit framework to make
+        progress.  Both shifts grow in lock-step on splu failure.
     block_active_set : bool
         Bulk add/remove per AS iter (default ``True``).  Same semantics
         as :class:`ProjectedCGQP`.
@@ -113,6 +125,7 @@ class KKTSparseQP:
         max_as_iter: int | None = None,
         delta_reg: float = 1e-8,
         delta_reg_max: float = 1.0,
+        dual_reg_ratio: float = 1e-4,
         block_active_set: bool = True,
         warm_start: bool = True,
     ):
@@ -124,6 +137,7 @@ class KKTSparseQP:
         self.max_as_iter = max_as_iter or (2 * n + m_eq + m_ineq + 20)
         self.delta_reg = delta_reg
         self.delta_reg_max = delta_reg_max
+        self.dual_reg_ratio = dual_reg_ratio
         self.block_active_set = block_active_set
         self.warm_start = warm_start
 
@@ -219,20 +233,35 @@ class KKTSparseQP:
             M_base = [ (σ+δ_p) I   A_actᵀ ]
                      [ A_act       −δ_d I ]
 
-        Two-level regularisation strategy:
+        Three-level regularisation strategy:
 
         1. **Try δ_d = 0 first**: the unbiased saddle-point.  Works for
            well-posed active sets where ``A_act`` has full row rank.
            The bias ``δ_p · λ`` from the (1,1) shift is negligible at
            δ_p ~ 1e-8 even when |λ| is large (e.g. HS15's λ ≈ 1750).
-        2. **On splu failure, enable dual regularisation** ``δ_d = δ_p``:
-           IPOPT-style primal-dual shift.  Keeps the system non-singular
-           when ``A_act`` has zero or near-zero rows (common in MPCC /
-           Scholtes formulations where some constraint Jacobians vanish
-           at certain x).  Adds a ``δ_d · λ`` bias to the constraint
-           residual; harmless for SOC / line search use.
-        3. **On continued failure, grow δ_p (and δ_d in lock-step)** by
-           10× per attempt, capped at ``self.delta_reg_max``.
+        2. **On splu failure, enable asymmetric dual regularisation**
+           ``δ_d = self.dual_reg_ratio · δ_p`` (default ratio 1e-4 →
+           δ_d = 1e-12 when δ_p = 1e-8).  Keeps the system non-singular
+           when ``A_act`` has zero or near-zero rows but minimises the
+           ``δ_d · λ`` bias on the constraint residual.
+
+           **Why asymmetric matters**: with symmetric ``δ_d = δ_p =
+           1e-8`` and TV-MCP-class problems where |λ| ~ 1e7 from
+           over-committed active sets, the constraint-side bias is
+           1e-8 · 1e7 = 0.1 — large enough to forbid the outer SQP
+           from driving the constraint violation below ~0.1.  At ratio
+           1e-4 the bias drops to 1e-3, freeing the merit framework
+           to make progress.
+        3. **On continued failure, grow both δ_p and δ_d in lock-step**
+           by 10× per attempt, capped at ``self.delta_reg_max``.
+
+        Pre-emptive dual reg fires when ``m_act > n`` because SuperLU's
+        internal pivoting can hit invalid BLAS calls (cblas_dtrsv,
+        cblas_dgemv) on rank-deficient saddle-point matrices — those
+        *print to stderr but do not raise Python exceptions*, so the
+        try/except below can't catch them and the lu factor is silently
+        corrupted.  m_act > n is a proof of rank deficiency, so we skip
+        straight to the asymmetric-regularised system.
 
         Crucially for the Woodbury overlay: the L-BFGS rank correction
         ``W D Wᵀ`` enters only the (1,1) block, so SMW math is identical
@@ -244,24 +273,16 @@ class KKTSparseQP:
         n = self.n
         m_act = A_act.shape[0]
         delta = self.delta_reg
-        # Pre-emptive dual regularisation when over-committed.  SuperLU's
-        # internal pivoting can hit invalid BLAS calls (cblas_dtrsv,
-        # cblas_dgemv) on rank-deficient saddle-point matrices — these
-        # *print to stderr but do not raise Python exceptions*, so our
-        # try/except can't catch them and the resulting lu factor is
-        # silently corrupted.  When m_act > n the system is provably
-        # rank-deficient, so we skip the unbiased attempt and go straight
-        # to (2,2) = -δI which makes the matrix non-singular by
-        # construction.  Bias on λ is δ·|λ| ~ 1e-8·|λ|; harmless for the
-        # SQP outer line search.
+        # Pre-emptive dual regularisation when over-committed (see above).
         dual_reg = (m_act > n)
 
         for _ in range(20):  # at most 20 attempts; covers 1e-8 → 1e+4
             sigma_eff = sigma + delta
+            delta_d   = delta * self.dual_reg_ratio   # asymmetric: ≪ δ_p
             top_left  = sigma_eff * sp.eye(n, format="csc")
             if m_act > 0:
                 if dual_reg:
-                    bottom_right = -delta * sp.eye(m_act, format="csc")
+                    bottom_right = -delta_d * sp.eye(m_act, format="csc")
                 else:
                     bottom_right = sp.csc_matrix((m_act, m_act))
                 M = sp.bmat(
