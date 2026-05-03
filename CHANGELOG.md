@@ -4,6 +4,34 @@ All notable changes to **pyfiltersqp** are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — large-n equality-heavy backend
+
+- **`ProjectedCGQP`** (`backend="pcg"`): projected-CG inner solve
+  (Nocedal-Wright Alg 16.2) wrapped by the same primal-dual active-set
+  loop as `ImplicitLBFGSQP` (Bland's rule, one-step tabu). Inexact-Newton
+  style: loose `cg_tol=1e-4` and a hard `cg_max_iter` cap so a single SQP
+  step is always bounded. Empirically wins by 2–6× on equality-heavy
+  large-n problems (eq_quadratic at n=3000–5000) where direct Schur
+  factorisation becomes the bottleneck. Exported as
+  `pyfiltersqp.ProjectedCGQP`.
+- **Auto-router now picks PCG** for equality-heavy problems at n > 50.
+  Heuristic: `m_eq > max(10, n/20)` AND `n_bound < n/5` AND `m_ineq < m_eq`.
+  No user opt-in required — `solve(...)` chooses automatically.
+- **`LBFGSMemory.diag()`** — returns `diag(B_k)` in O(n·m).  Public
+  utility intended for preconditioning structured KKT solvers; matches
+  `np.diag(materialise())` to machine precision.
+
+### Investigated and rejected
+
+- **Jacobi preconditioner for PCG**: tried using `LBFGSMemory.diag()` as
+  `M⁻¹` in projected CG; consistently slower than no preconditioner across
+  every problem class.  L-BFGS B has σI as its dominant well-conditioned
+  base; localised rank-2 contributions to `diag(B)` redistribute more
+  than they condition, increasing CG iteration count.  PCG runs
+  unpreconditioned by design.
+
 ## [0.3.0] — 2026-05-02
 
 First public release on PyPI. The solver now beats cyipopt IPOPT on most of
@@ -106,6 +134,6 @@ the classical CUTEst deck (1.3× – 70× faster on 41/45 successful problems).
   KKT residual convergence test, OSQP-based QP subproblem.
 - Hock-Schittkowski test problems (HS15, HS71, HS100).
 
-[0.3.0]: https://github.com/davidvillacis/pyfiltersqp/releases/tag/v0.3.0
-[0.2.0]: https://github.com/davidvillacis/pyfiltersqp/releases/tag/v0.2.0
-[0.1.0]: https://github.com/davidvillacis/pyfiltersqp/releases/tag/v0.1.0
+[0.3.0]: https://github.com/dvillacis/pyfiltersqp/releases/tag/v0.3.0
+[0.2.0]: https://github.com/dvillacis/pyfiltersqp/releases/tag/v0.2.0
+[0.1.0]: https://github.com/dvillacis/pyfiltersqp/releases/tag/v0.1.0

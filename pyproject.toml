@@ -46,10 +46,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage      = "https://github.com/davidvillacis/pyfiltersqp"
-Repository    = "https://github.com/davidvillacis/pyfiltersqp"
-Issues        = "https://github.com/davidvillacis/pyfiltersqp/issues"
-Changelog     = "https://github.com/davidvillacis/pyfiltersqp/blob/main/CHANGELOG.md"
+Homepage      = "https://github.com/dvillacis/pyfiltersqp"
+Repository    = "https://github.com/dvillacis/pyfiltersqp"
+Issues        = "https://github.com/dvillacis/pyfiltersqp/issues"
+Changelog     = "https://github.com/dvillacis/pyfiltersqp/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # Test dependencies for `uv sync --extra dev` / `pip install pyfiltersqp[dev]`.

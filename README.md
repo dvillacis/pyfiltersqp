@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/pyfiltersqp.svg)](https://pypi.org/project/pyfiltersqp/)
 [![Python](https://img.shields.io/pypi/pyversions/pyfiltersqp.svg)](https://pypi.org/project/pyfiltersqp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/davidvillacis/pyfiltersqp/actions/workflows/ci.yml/badge.svg)](https://github.com/davidvillacis/pyfiltersqp/actions/workflows/ci.yml)
+[![CI](https://github.com/dvillacis/pyfiltersqp/actions/workflows/ci.yml/badge.svg)](https://github.com/dvillacis/pyfiltersqp/actions/workflows/ci.yml)
 
 Open-source SQP (Sequential Quadratic Programming) solver in Python with
 L-BFGS Hessian approximation, l₁-merit and filter line searches, and

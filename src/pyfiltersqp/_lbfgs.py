@@ -456,3 +456,30 @@ class LBFGSMemory:
             B += np.outer(self._y[i], self._y[i]) / sy_i
 
         return B
+
+    def diag(self) -> np.ndarray:
+        """
+        Return ``diag(B_k)``.  Cost: O(n · memory) — uses the same
+        ``_precompute_Bs`` factors as ``matvec`` / ``materialise``.
+
+        Used as a Jacobi preconditioner for projected-CG.  Each stored
+        rank-2 BFGS update contributes ``-(B_i s_i)[k]² / β_i + y_i[k]² / sy_i``
+        to ``diag(B)[k]``.
+
+        Always positive: starts at ``σ > 0`` and Powell damping keeps every
+        rank-2 update PD-preserving.  Caller can still clip near zero for
+        numerical safety.
+        """
+        n = self.n
+        m = len(self._s)
+        sigma = 1.0 / self._scale
+        d = np.full(n, sigma)
+        if m == 0:
+            return d
+
+        Bs, beta = self._precompute_Bs()
+        for i in range(m):
+            sy_i = float(self._y[i] @ self._s[i])
+            d -= Bs[:, i] ** 2 / beta[i]
+            d += self._y[i] ** 2 / sy_i
+        return d
