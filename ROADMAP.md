@@ -255,11 +255,143 @@ With P = σI + Ψ M Ψᵀ, apply the **Woodbury identity** to factor the KKT sys
 For purely equality-constrained or bound-only subproblems, a null-space projected CG
 (Steihaug / Hestenes-Stiefel) converges in O(n·m·cg_iters) and needs only `matvec`.
 
-- [ ] `_qp_pcg.py`: `solve_pcg(matvec, J_eq, J_ineq, g, ...)` — projected CG for the QP
-- [ ] Preconditioner: diagonal of B_k (= σ + row norms of Ψ) available in O(n·m)
-- [ ] Inexact termination: stop CG at relative residual < `tol_cg` (default 0.1·tol_opt),
-      tighten as outer SQP converges (super-linear strategy)
-- [ ] Route `QPSubproblem` to PCG when n > `large_n_threshold` (default 5 000)
+- [x] `_qp_pcg.py` — `ProjectedCGQP`: active-set wrapper (mirrors ImplicitLBFGSQP
+      with the same Bland + tabu anti-cycling) around a Nocedal-Wright Alg 16.2
+      projected-CG inner solve.  Same `solve` / `solve_soc` interface as the
+      other backends.  Selectable via `backend="pcg"`.
+- [x] Inexact termination: relative residual `cg_tol` (default 1e-4 — loose
+      by design, inexact-Newton style).  Inner iter cap `min(2(m_eq+50), 500)`
+      bounds the cost when CG would otherwise wander.
+- [x] Diagonal-of-B preconditioner experiment (rejected): tried Jacobi
+      preconditioner ``M = diag(B_k)`` via ``LBFGSMemory.diag()``; consistently
+      slower than no preconditioner because L-BFGS B already has its
+      dominant component (σI) perfectly conditioned.  Localised rank-2
+      contributions to ``diag(B)`` redistribute more than they condition.
+      Method ``LBFGSMemory.diag()`` retained as a public utility for other
+      contexts (v0.6a Woodbury-KKT preconditioning).
+- [ ] Tighten `cg_tol` super-linearly as outer SQP converges
+- [x] Auto-router heuristic: PCG when `m_eq > max(10, n/20)`,
+      `n_bound < n/5`, and `m_ineq < m_eq`.  Empirical wins:
+      eq_quadratic n=1000 → 53 ms (vs implicit 71, woodbury 161),
+      n=3000 → 423 ms (vs 790, 1924), n=5000 → 1225 ms (vs 2346, 7073).
+
+#### 6b.1  Block active-set + warm-start (2026-05-02)
+
+Single-pivot active-set add/remove costs O(m_act) AS iters per QP, dominating
+runtime when m_act is large.  Real bench numbers from
+`ineq_constrained_quadratic(n=1000, m_ineq=200)` confirmed the bottleneck.
+
+- [x] **Block add / block remove** in `ImplicitLBFGSQP` and `ProjectedCGQP`:
+      add ALL violated inactive constraints / remove ALL sufficiently-negative-
+      multiplier active constraints in one AS iter, with the existing visited-
+      set cycle detector flipping to single-pivot Bland's rule on revisit.
+      Cuts AS iters from O(m_act) to typically 2–3 per QP.  At n=1000,
+      m_act=200: 201 AS iters / 192 ms → 2 AS iters / 5 ms (40× per-QP solve).
+- [x] **Active-set warm-start across SQP iterations**: stash final active set
+      at end of `solve()`, seed next `solve()` with it.  Truly fixed variables
+      (lb ≈ ub) re-added on every call so the warm set stays consistent under
+      bound changes.
+
+#### 6b.2  Sparse Jacobian fast path (2026-05-02)
+
+`_build` was densifying every active row via `J[i,:].todense()` even when J was
+already sparse — measured ~5 % of `_qp_pcg.solve` cumulative time at n=10k,
+m_eq=2k, and worse for PCG which calls `project()` (sparse @ vec) per CG iter.
+
+- [x] `_build_sparse` in both backends — CSR slicing + `sp.vstack` instead
+      of per-row densify; identity rows for bounds built from a single COO
+      construction.
+- [x] `_schur_solve` accepts sparse `A_act`; only `A_actᵀ` is densified for
+      the L-BFGS batched matvec (intrinsically dense output, n × m_act).
+- [x] PCG `_pcg` accepts sparse `A`: per-CG-iter `A @ v` and `Aᵀ @ v` use
+      sparse matvec; the inner Cholesky on `AAᵀ` densifies once per AS iter.
+- [x] Equivalence test (`test_sparse_jacobian_matches_dense`) parameterised
+      across implicit and PCG backends.
+- [x] Bench (n=2000, m_ineq=500, sparse-J): Implicit 0.50 s → 0.30 s (~1.7×);
+      PCG 0.33 s → 0.017 s (~20×).
+
+#### 6b.3  TV-MCP regression — rank-deficient projection (2026-05-03)
+
+External report (`bilevel_mpcc_imaging` TV-MCP): pyfiltersqp called with PCG
+backend on n=1792, m_eq=1280 sparse problem hung indefinitely with no output.
+Live `PYFILTERSQP_DEBUG=1` instrumentation traced the failure:
+
+* AS iter 5: `m_act=454`, single AS iter took **18 s** because Cholesky on
+  `AAᵀ` failed (rank-deficient: m_act > n=400 after equalities + block-added
+  ineqs) and the fallback `np.linalg.lstsq(AAT, rhs)` was being called *per
+  CG inner iter*, costing O(m_act³) × hundreds of CG iters.
+
+- [x] **Rank-deficient AAᵀ regulariser** (`_qp_pcg.py:_pcg`): on Cholesky
+      failure, add `1e-10 · trace(AAᵀ) / m_act · I` and refactor.  Keeps every
+      `project()` at O(m_act²) triangular-solve cost.  Cuts the 18 s AS iter
+      to ~2 s on the same problem.
+
+- [x] **Live debug instrumentation** behind `PYFILTERSQP_DEBUG=1` env var:
+      `[PYFSQP] ENTER solve` / `[PCG] AS_iter=N m_act=… build=…ms pcg=…ms` /
+      `[PCG] EXIT solve`.  Lets external callers diagnose stalls without
+      forwarding `verbose=True` through multi-layer adapters.
+- [x] **Per-iter live print under `verbose=True`** in `SQPSolver.solve` —
+      previously only populated `result.history`.
+
+- [x] **Cycle watchdog (item 6b.4)** — two-stage safety net in both
+      `_qp_pcg.py` and `_implicit_qp.py`:
+      1. **FORCE-BLAND**: when m_act > n for 3 consecutive AS iters, force
+         single-pivot mode (block-add can otherwise toggle large groups of
+         rows forever in the rank-deficient regime).  Persistence guard
+         avoids tripping on transient block-add spikes.
+      2. **Bland-window watchdog**: track m_act over the last K=30 iters
+         spent in bland mode; exit AS loop when `max - min ≤ 5` (catches
+         period-2 {599,600}, period-3 {544,545,546}, and any small-
+         amplitude oscillation regardless of cycle length).  Returns the
+         current iterate as a best-effort step; the outer SQP's line
+         search rejects it if it isn't a descent direction.
+      Verified: TV-MCP repro that previously hung indefinitely now exits
+      cleanly within ~230 s on the first QP and continues to subsequent
+      SQP iterations.  All 169 HS / unit tests still pass.
+- [ ] **Constraint redundancy detection (item 6b.5)** — when m_eq + active
+      ineqs exceed n, A_act has linearly dependent rows by counting alone.
+      Pivoted-QR basis selection on A_act would identify the redundant rows
+      and exclude them from the KKT system, eliminating the cycle root cause.
+      Higher effort than the watchdog but the principled fix.
+- [x] **Sparse augmented-KKT backend (item 6b.6, 2026-05-03)** —
+      :class:`KKTSparseQP` in ``_qp_kkt.py``.  Solves the augmented KKT
+      system::
+
+          [ B + δI    A_actᵀ ] [ p ]   [ -g ]
+          [ A_act      0     ] [ λ ] = [  b ]
+
+      via ``scipy.sparse.linalg.splu`` on the *sparse base*
+
+          M_base = [ (σ+δ_p) I    A_actᵀ ]
+                   [ A_act        −δ_d I ]
+
+      then applies Sherman-Morrison-Woodbury to recover the full
+      L-BFGS Hessian ``B = σI + W D Wᵀ`` in ``2m + 1`` extra triangular
+      solves.  Two-level regularisation: try unbiased ``δ_d = 0`` first
+      (works for full-row-rank ``A_act``); fall back to IPOPT-style
+      primal-dual shift ``δ_d = δ_p`` on splu failure (handles MPCC
+      Scholtes-style zero-row Jacobians).  Same active-set wrapper as
+      PCG: block add/remove, FORCE-BLAND when m_act > n, bland-window
+      watchdog, warm-start.
+
+      Headline numbers on the user's TV-MCP (image-bilevel MPCC,
+      n=1792, m_eq=1280, m_ineq=192, sparse J, Scholtes ε-continuation):
+      * Woodbury:  285 s per outer iter, never converged (dense
+                   ``np.linalg.inv`` on m_constr × m_constr ≈ 1280²)
+      * PCG:       hung indefinitely (rank-deficient ``A Aᵀ`` cycle)
+      * **KKT:     9.1 s for the whole MCP solve loop (~7-23 ms per
+                   AS iter)** — same order of magnitude as IPOPT/MA57
+                   (2.9 s) using stock SciPy splu, no Fortran HSL deps.
+
+      Opt-in via ``backend="kkt"``.  Auto-router heuristic intentionally
+      not updated yet — needs cross-class benchmarks before promoting
+      KKT to a default selection (existing PCG / Implicit / Woodbury
+      auto-routes still cover their respective sweet spots).
+- [ ] **Auto-router KKT branch** — bench KKT against PCG / Woodbury on
+      eq_quadratic, ineq_quadratic, MPCC, PDE-discretised problems at
+      n ∈ {500, 1000, 2000, 5000}.  Promote to auto-selection when
+      ``m_eq + m_ineq > n/2`` AND constraint Jacobians sample sparse
+      via a one-shot probe.
 
 ### Common to 6a and 6b
 

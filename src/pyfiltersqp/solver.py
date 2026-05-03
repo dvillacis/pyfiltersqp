@@ -10,6 +10,8 @@ from ._lbfgs import LBFGSMemory
 from ._qp import QPSubproblem
 from ._implicit_qp import ImplicitLBFGSQP
 from ._qp_admm import WoodburyADMM
+from ._qp_pcg import ProjectedCGQP
+from ._qp_kkt import KKTSparseQP
 from ._line_search import (
     l1_merit, directional_deriv, update_penalty, armijo_backtrack,
     filter_backtrack,
@@ -49,18 +51,29 @@ class SQPSolver:
     osqp_options : dict, optional
         Passed directly to QPSubproblem / OSQP.  Only consulted when
         ``backend="osqp"`` (deprecated path — see below).
-    backend : {"auto", "implicit", "woodbury", "osqp"}
+    backend : {"auto", "implicit", "woodbury", "pcg", "kkt", "osqp"}
         QP backend selection (default "auto").
 
-        * **auto** — pick "implicit" when the active-set bound
-          ``m_eq + m_ineq + #finite_bounds`` ≤ ``max(20, n/10)``, else
-          "woodbury".  Matches the empirical winner across the large-scale
-          benchmark (see ``scripts/bench_large_scale.py``).
+        * **auto** — pick "implicit", "pcg", or "woodbury" from problem
+          shape.  See :meth:`SQPSolver._select_auto_backend` for the
+          three-tier heuristic.  ``"kkt"`` is *not* auto-selected; it is
+          opt-in only.
         * **implicit** — :class:`ImplicitLBFGSQP`, primal-dual active-set +
           Schur complement on ``LBFGSMemory._matvec``.  O(m_act · n · m).
         * **woodbury** — :class:`WoodburyADMM`, Woodbury-identity ADMM on
           the compact L-BFGS factors with a Schur-complement polish.  Cost
           per ADMM step is independent of the active set: O(n·m + m_constr²·m).
+        * **pcg** — :class:`ProjectedCGQP`, active-set + projected CG on
+          the L-BFGS Hessian.  O(cg_iters · n · m) per AS iter.
+        * **kkt** — :class:`KKTSparseQP`, sparse augmented-KKT direct
+          solve via ``scipy.sparse.linalg.splu`` plus a Sherman-Morrison-
+          Woodbury overlay for the L-BFGS rank-2k Hessian correction.
+          *Opt-in*: pass ``backend="kkt"`` explicitly.  Best for problems
+          where ``m_eq + m_ineq ≈ n`` and the constraint Jacobian is
+          sparse (PDE-constrained NLPs, image-bilevel MPCCs, structured
+          OCP transcriptions) — exactly the regime where PCG hits
+          rank-deficient ``A Aᵀ`` and Woodbury-ADMM hits its dense
+          ``O(m_constr²·m)`` ``inv`` bottleneck.
         * **osqp** — *deprecated*.  :class:`QPSubproblem` materialises the
           dense n×n Hessian and feeds it to OSQP.  Slower than the implicit
           and Woodbury paths at every problem size in our benchmarks
@@ -114,10 +127,10 @@ class SQPSolver:
 
         # Resolve QP backend.  The boolean flags remain as overrides for
         # backward compatibility; explicit ``backend=`` wins if both are set.
-        if backend not in ("auto", "implicit", "woodbury", "osqp"):
+        if backend not in ("auto", "implicit", "woodbury", "pcg", "kkt", "osqp"):
             raise ValueError(
                 f"backend must be one of 'auto', 'implicit', 'woodbury', "
-                f"'osqp'; got {backend!r}"
+                f"'pcg', 'kkt', 'osqp'; got {backend!r}"
             )
         if backend == "auto":
             if use_woodbury_admm:
@@ -131,30 +144,40 @@ class SQPSolver:
     @staticmethod
     def _select_auto_backend(problem: NLPProblem) -> str:
         """
-        Pick "implicit" or "woodbury" based on the expected active-set size.
+        Pick "implicit", "pcg", or "woodbury" based on the expected
+        active-set size and constraint structure.
 
-        ImplicitLBFGSQP costs O(m_act · n · memory) per Schur solve, so it
-        wins when ``m_act`` stays small relative to ``n``.  Woodbury-ADMM's
-        cost is independent of the active set but has a fixed per-step
-        setup cost (~2 ms) that dominates at small n.
+        Three QP backends, each with a different sweet spot:
 
-        Two-tier heuristic, validated against the CUTEst + large-scale
+        * **ImplicitLBFGSQP** — primal-dual active-set + direct Schur
+          (lstsq on m_act × m_act).  O(m_act · n · memory) per AS step.
+          Wins when m_act stays small relative to n.
+        * **ProjectedCGQP** — same active-set wrapper but the inner
+          equality solve is projected CG.  Inexact-Newton style: avoids
+          the m_act³ Schur factorisation.  Wins on equality-heavy
+          large-n problems where direct Schur is the bottleneck.
+        * **WoodburyADMM** — ADMM with Woodbury identity on the compact
+          L-BFGS factors.  Cost per step is independent of the active
+          set; has fixed ~2 ms setup overhead.  Wins when bounds /
+          inequalities saturate and the active-set methods churn.
+
+        Three-tier heuristic, validated against CUTEst + large-scale
         Python benchmarks (2026-05-02):
 
         Small n (n ≤ 50):
-            Bounds are usually mostly inactive, and Woodbury's setup cost
-            dwarfs the per-step work — pick implicit unless the inequality
-            count alone is > 2n (KISSING2-like saturated active set).
+            Bounds are usually mostly inactive, Woodbury setup dwarfs
+            per-step work — pick implicit unless the inequality count
+            alone is > 2n (KISSING2-like saturated active set).
 
         Large n (n > 50):
-            Bounds matter — heavily-bound problems (Rosenbrock-chain at
-            n=1000 has all n bounds finite and many active) need Woodbury.
-            Use ``m_eq + m_ineq + #finite_bounds`` as the active-set proxy.
+            * Active set provably small → implicit
+            * Equality-heavy without dominant bounds → PCG
+            * Otherwise (bounds- or inequality-heavy) → Woodbury
 
         Empirical wins:
         * unconstrained MGH → implicit wins by 5–250× (active set empty)
-        * HS-family (n ≤ 10, all-bound) → implicit (was Woodbury, 30× slower)
-        * eq-only quadratic at n=1000 → implicit by 2×
+        * HS-family (n ≤ 10, all-bound) → implicit
+        * eq_quadratic at n=3000–5000 → PCG by 2× over implicit, 5–6× over woodbury
         * Rosenbrock-chain at n=1000 (bound-heavy) → Woodbury by 28×
         * ineq_quadratic at n=1000 (m_ineq=200) → Woodbury by 22×
         * KISSING2 (n=94, m_ineq=625) → Woodbury (only one that converges)
@@ -169,12 +192,30 @@ class SQPSolver:
                 return "woodbury"
             return "implicit"
 
-        # Large n — count bounds in the active-set proxy
+        # --- Large n -----------------------------------------------------
         n_bound = int(np.sum(np.isfinite(problem.xl))
                       + np.sum(np.isfinite(problem.xu)))
         active_max = m_eq + m_ineq + n_bound
-        if active_max <= max(20, n // 10):
+
+        # Active set provably small → direct Schur via Implicit.
+        # Strict ``<`` so boundary cases (active_max == n/10, e.g.
+        # eq_quadratic with default sizing) fall through to the PCG
+        # check rather than getting stuck on direct Schur.
+        if active_max < max(20, n // 10):
             return "implicit"
+
+        # Equality-dominant and not bound-heavy → PCG.  ``m_eq > max(10, n/20)``
+        # filters out problems where m_eq is incidental; ``n_bound < n/5``
+        # excludes Rosenbrock-chain-style bound-heavy cases (PCG's
+        # active-set churn explodes the same way ImplicitLBFGSQP's does);
+        # ``m_ineq < m_eq`` excludes inequality-saturated cases (Woodbury
+        # handles those better).
+        if (m_eq > max(10, n // 20)
+                and n_bound < n // 5
+                and m_ineq < m_eq):
+            return "pcg"
+
+        # Default for large n: Woodbury.
         return "woodbury"
 
     def solve(
@@ -204,6 +245,19 @@ class SQPSolver:
         p = problem
         n, m_eq, m_ineq = p.n, p.m_eq, p.m_ineq
 
+        # Optional unconditional entry print (env-var triggered).  Lets the
+        # caller distinguish "stuck in pyfiltersqp" from "stuck before
+        # pyfiltersqp" without needing verbose=True forwarded through
+        # multi-layer adapters.  Set PYFILTERSQP_DEBUG=1 to enable.
+        import os as _os
+        if _os.environ.get("PYFILTERSQP_DEBUG"):
+            import sys as _sys
+            print(
+                f"[PYFSQP] ENTER solve  n={n}  m_eq={m_eq}  m_ineq={m_ineq}  "
+                f"backend={self.backend}",
+                flush=True, file=_sys.stderr,
+            )
+
         x       = np.asarray(x0, dtype=float).copy()
         lam_eq  = np.zeros(m_eq)  if lam_eq0  is None else np.asarray(lam_eq0,  dtype=float).copy()
         lam_ineq = np.zeros(m_ineq) if lam_ineq0 is None else np.asarray(lam_ineq0, dtype=float).copy()
@@ -220,6 +274,10 @@ class SQPSolver:
             qp = WoodburyADMM(n, m_eq, m_ineq)
         elif backend == "implicit":
             qp = ImplicitLBFGSQP(n, m_eq, m_ineq)
+        elif backend == "pcg":
+            qp = ProjectedCGQP(n, m_eq, m_ineq)
+        elif backend == "kkt":
+            qp = KKTSparseQP(n, m_eq, m_ineq)
         else:
             qp = QPSubproblem(n, m_eq, m_ineq, self.osqp_options)
         mu    = self.mu0
@@ -287,26 +345,38 @@ class SQPSolver:
         if g_inf > 1e4:
             lbfgs._scale = 1.0 / g_inf
 
+        if self.verbose:
+            import sys, time as _time
+            print(
+                f"  pyfsqp ENTER solve  backend={backend}  n={n}  m_eq={m_eq}  "
+                f"m_ineq={m_ineq}  ‖g0‖∞={g_inf:.2e}",
+                flush=True,
+            )
+            _t_qp_total = [0.0]
+            _t_qp_last  = [0.0]
+
         for k in range(self.max_iter):
             # 1. Solve QP subproblem
-            if self.use_woodbury_admm:
-                # Woodbury-ADMM path: O(n·m) per step, no dense B_k needed.
-                # update_penalty uses lbfgs.matvec for pᵀ B p.
+            if backend in ("woodbury", "implicit", "pcg", "kkt"):
+                # Implicit / Woodbury / PCG / KKT paths: no dense B_k needed.
+                # `update_penalty` uses lbfgs.matvec for pᵀ B p.
                 B = lbfgs.matvec
+                if self.verbose:
+                    import time as _time
+                    _t0 = _time.perf_counter()
                 step, lam_eq_new, lam_ineq_new, lam_lb_new, lam_ub_new, qp_ok = qp.solve(
                     lbfgs, g, c_eq, J_eq, c_ineq, J_ineq, x, p.xl, p.xu
                 )
-            elif self.use_implicit_qp:
-                # Implicit path: no materialise — O(m_act · n · m) per solve.
-                # For update_penalty (needs pᵀ B p), use lbfgs.matvec which
-                # correctly computes B_k v in O(n · m) without building B_k.
-                B = lbfgs.matvec
-                step, lam_eq_new, lam_ineq_new, lam_lb_new, lam_ub_new, qp_ok = qp.solve(
-                    lbfgs, g, c_eq, J_eq, c_ineq, J_ineq, x, p.xl, p.xu
-                )
+                if self.verbose:
+                    _t_qp_last[0] = _time.perf_counter() - _t0
+                    _t_qp_total[0] += _t_qp_last[0]
+                    print(
+                        f"  pyfsqp iter={k:4d}  qp_solve={_t_qp_last[0]*1000:7.1f} ms  "
+                        f"(cum={_t_qp_total[0]:.1f}s)  qp_ok={qp_ok}  |step|={float(np.linalg.norm(step)):.2e}",
+                        flush=True,
+                    )
             else:
-                # Dense OSQP path: O(n²) materialise + OSQP ADMM.
-                # materialise() returns B_k directly (the Hessian); pass to OSQP.
+                # Dense OSQP path: O(n²) materialise + OSQP ADMM (deprecated).
                 B = lbfgs.materialise()
                 step, lam_eq_new, lam_ineq_new, lam_lb_new, lam_ub_new, qp_ok = qp.solve(
                     B, g, c_eq, J_eq, c_ineq, J_ineq, x, p.xl, p.xu
@@ -565,6 +635,14 @@ class SQPSolver:
                     step_size=alpha,
                     qp_iters=0,   # TODO: extract from OSQP result
                 ))
+                import sys
+                print(
+                    f"  pyfsqp iter={k:4d}  obj={f_new:+.4e}  "
+                    f"feas_eq={kkt_new.primal_eq:.2e}  feas_in={kkt_new.primal_ineq:.2e}  "
+                    f"dual={kkt_new.dual:.2e}  compl={kkt_new.compl:.2e}  "
+                    f"alpha={alpha:.2e}  |p|={float(np.linalg.norm(alpha*step)):.2e}",
+                    flush=True,
+                )
 
             # 7. Advance
             x, f, g        = x_new, f_new, g_new

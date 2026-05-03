@@ -24,6 +24,8 @@ from .problem import NLPProblem
 from .result import SQPResult, IterationInfo
 from .solver import SQPSolver, solve
 from ._qp_admm import WoodburyADMM
+from ._qp_pcg import ProjectedCGQP
+from ._qp_kkt import KKTSparseQP
 
 try:
     __version__ = _pkg_version("pyfiltersqp")
@@ -33,5 +35,5 @@ except PackageNotFoundError:                       # pragma: no cover
 
 __all__ = [
     "NLPProblem", "SQPResult", "IterationInfo", "SQPSolver", "solve",
-    "WoodburyADMM", "__version__",
+    "WoodburyADMM", "ProjectedCGQP", "KKTSparseQP", "__version__",
 ]

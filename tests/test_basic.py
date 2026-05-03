@@ -238,6 +238,79 @@ def test_woodbury_admm_hs_objective(name, entry):
     )
 
 
+# ---------------------------------------------------------------------------
+# Projected-CG QP tests (backend="pcg")
+#
+# PCG's design point is large-n equality-heavy problems.  At HS-size (n ≤ 10)
+# its inexact-Newton flavour is not a great fit — HS100 specifically
+# (n=7, all-bound, m_ineq=4) is a known forced-backend limitation.  The
+# auto-router never picks PCG for n ≤ 50, so this only matters for users who
+# explicitly opt in at small scale.
+# ---------------------------------------------------------------------------
+
+# Subset where PCG is expected to converge — covers unconstrained, single
+# eq, single ineq, and mixed at HS-size.  Excludes hs100 (auto-router never
+# picks PCG there anyway; see module docstring above).
+_PCG_HS_SUBSET = [k for k in PROBLEMS if k != "hs100"]
+
+
+@pytest.mark.parametrize("name", _PCG_HS_SUBSET)
+def test_pcg_hs_convergence(name):
+    """ProjectedCGQP converges on the HS subset where PCG is well-suited."""
+    entry = PROBLEMS[name]
+    result = solve(entry["problem"], entry["x0"], backend="pcg")
+    assert result.success, (
+        f"{name} (pcg): failed with status={result.status} ({result.message})"
+    )
+
+
+@pytest.mark.parametrize("name", _PCG_HS_SUBSET)
+def test_pcg_hs_objective(name):
+    """ProjectedCGQP objective matches the known optimum to OBJ_RTOL."""
+    entry = PROBLEMS[name]
+    result = solve(entry["problem"], entry["x0"], backend="pcg")
+    f_opt = entry["f_opt"]
+    assert abs(result.obj - f_opt) / (1.0 + abs(f_opt)) < OBJ_RTOL, (
+        f"{name} (pcg): obj={result.obj:.6f}, expected≈{f_opt:.6f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sparse-KKT tests (backend="kkt")
+#
+# KKTSparseQP's design point is large-n problems with m_eq ~ n and sparse
+# constraint Jacobians.  At HS-size we still expect convergence on the
+# bulk of the suite — but HS100's all-bound saturated structure is the
+# same forced-backend pathology as for PCG (n=7 ≪ default lbfgs memory,
+# splu sees a near-singular augmented matrix on the first iter).  The
+# auto-router never picks KKT for any size; this just guards against
+# regressions in the opt-in path.
+# ---------------------------------------------------------------------------
+
+_KKT_HS_SUBSET = [k for k in PROBLEMS if k != "hs100"]
+
+
+@pytest.mark.parametrize("name", _KKT_HS_SUBSET)
+def test_kkt_hs_convergence(name):
+    """KKTSparseQP converges on the HS subset where KKT is well-suited."""
+    entry = PROBLEMS[name]
+    result = solve(entry["problem"], entry["x0"], backend="kkt")
+    assert result.success, (
+        f"{name} (kkt): failed with status={result.status} ({result.message})"
+    )
+
+
+@pytest.mark.parametrize("name", _KKT_HS_SUBSET)
+def test_kkt_hs_objective(name):
+    """KKTSparseQP objective matches the known optimum to OBJ_RTOL."""
+    entry = PROBLEMS[name]
+    result = solve(entry["problem"], entry["x0"], backend="kkt")
+    f_opt = entry["f_opt"]
+    assert abs(result.obj - f_opt) / (1.0 + abs(f_opt)) < OBJ_RTOL, (
+        f"{name} (kkt): obj={result.obj:.6f}, expected≈{f_opt:.6f}"
+    )
+
+
 def test_woodbury_solve_unit():
     """WoodburyADMM._woodbury_apply(rhs) must match dense (B + ρ AᵀA)⁻¹ rhs."""
     from pyfiltersqp._qp_admm import WoodburyADMM
@@ -349,3 +422,45 @@ def test_lbfgs_materialise_is_hessian():
     y_last = lbfgs._y[-1]
     np.testing.assert_allclose(B @ s_last, y_last, rtol=1e-10,
                                 err_msg="materialise() secant condition B @ s = y failed")
+
+
+# ---------------------------------------------------------------------------
+# Sparse vs dense Jacobian equivalence
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("backend", ["implicit", "pcg", "kkt"])
+def test_sparse_jacobian_matches_dense(backend):
+    """Sparse and dense Jacobian inputs must produce identical solutions."""
+    import scipy.sparse as sp
+    from pyfiltersqp import NLPProblem
+
+    n, m_ineq = 80, 20
+    rng = np.random.default_rng(0)
+    c = rng.standard_normal(n)
+    x0 = np.zeros(n)
+
+    rows = np.arange(m_ineq)
+    cols = np.arange(m_ineq)
+    data = -np.ones(m_ineq)
+    J_sparse = sp.csr_matrix((data, (rows, cols)), shape=(m_ineq, n))
+    J_dense  = J_sparse.toarray()
+
+    common = dict(
+        n=n, m_eq=0, m_ineq=m_ineq,
+        xl=np.full(n, -np.inf), xu=np.full(n, np.inf),
+        objective=lambda x: 0.5 * float((x - c) @ (x - c)),
+        gradient=lambda x: x - c,
+        ineq_constraints=lambda x: -x[:m_ineq],
+        x0=x0,
+    )
+    p_sparse = NLPProblem(ineq_jacobian=lambda x: J_sparse, **common)
+    p_dense  = NLPProblem(ineq_jacobian=lambda x: J_dense,  **common)
+
+    r_sparse = solve(p_sparse, x0.copy(), backend=backend)
+    r_dense  = solve(p_dense,  x0.copy(), backend=backend)
+
+    assert r_sparse.success and r_dense.success
+    np.testing.assert_allclose(r_sparse.x, r_dense.x, atol=1e-7,
+                               err_msg=f"{backend}: sparse vs dense x mismatch")
+    np.testing.assert_allclose(r_sparse.obj, r_dense.obj, rtol=1e-9,
+                               err_msg=f"{backend}: sparse vs dense obj mismatch")
