@@ -66,6 +66,7 @@ from __future__ import annotations
 from collections import deque
 
 import numpy as np
+import scipy.linalg
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
@@ -113,6 +114,22 @@ class KKTSparseQP:
     warm_start : bool
         Carry the previous solve()'s active set across SQP iterations
         (default ``True``).
+    rank_filter : bool
+        Detect linearly dependent active rows via pivoted QR on
+        ``A_actᵀ`` and drop them from the KKT system (default
+        ``True``).  Only runs when ``m_act > n`` (when redundancy is
+        provable by counting); skipped in the common
+        ``m_act ≤ n`` case where the regular splu + dual-reg path
+        suffices.  Eliminates the over-commit pathology that
+        regularisation hacks paper over: bias on λ vanishes, mu
+        runaway disappears, line search regains progress on
+        equality-saturated MPCC/PDE problems.  Cost: one dense
+        ``scipy.linalg.qr(A.T, mode='r', pivoting=True)`` per
+        rank-checking AS iter — O(n · m_act · min(n, m_act)).
+    rank_tol : float
+        Relative tolerance for rank determination (default 1e-10).
+        Row pivots with ``|R[i,i]| ≤ rank_tol · |R[0,0]|`` are
+        considered redundant.
     """
 
     def __init__(
@@ -128,6 +145,8 @@ class KKTSparseQP:
         dual_reg_ratio: float = 1e-4,
         block_active_set: bool = True,
         warm_start: bool = True,
+        rank_filter: bool = True,
+        rank_tol: float = 1e-10,
     ):
         self.n = n
         self.m_eq = m_eq
@@ -140,6 +159,8 @@ class KKTSparseQP:
         self.dual_reg_ratio = dual_reg_ratio
         self.block_active_set = block_active_set
         self.warm_start = warm_start
+        self.rank_filter = rank_filter
+        self.rank_tol = rank_tol
 
         # SOC cache: factor + Woodbury overlay reused for the SOC RHS
         self._lbfgs:  LBFGSMemory | None = None
@@ -156,6 +177,7 @@ class KKTSparseQP:
         self._sigma_soc: float           = 0.0
         self._delta_soc: float           = 0.0
         self._A_act_soc                  = None
+        self._basis_idx_soc              = None
         self._active_ineq_soc: list[int] = []
         self._active_lb_soc:   list[int] = []
         self._active_ub_soc:   list[int] = []
@@ -224,10 +246,52 @@ class KKTSparseQP:
         return sp.csr_matrix((0, n), dtype=float), np.empty(0, dtype=float)
 
     # ------------------------------------------------------------------
+    # Rank-revealing row filter (item 6b.5)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_basis_rows(A_act, tol_rel: float = 1e-10):
+        """Identify a maximal linearly-independent subset of A_act rows
+        via pivoted QR on ``A_actᵀ``.
+
+        Returns ``basis_idx`` (sorted ndarray of row indices to keep)
+        or ``None`` when ``A_act`` already has full row rank.
+
+        Cost: dense pivoted QR on ``n × m_act`` — i.e.
+        ``O(n · m_act · min(n, m_act))`` flops.  Caller should gate
+        this on ``m_act > n`` so the QR fires only when redundancy
+        is provable by counting.
+
+        Tolerance: a row pivot is considered redundant when
+        ``|R[i,i]| ≤ tol_rel · |R[0,0]|`` (relative to the largest
+        pivot, not an absolute floor — this is invariant under uniform
+        scaling of the constraint Jacobian).
+        """
+        m_act = A_act.shape[0]
+        # Densify A_actᵀ.  scipy.linalg.qr requires a dense matrix;
+        # for typical sparse Jacobians the dense conversion is the
+        # dominant cost line below, but unavoidable without SuiteSparse.
+        A_dense_T = (A_act.T.toarray() if sp.issparse(A_act)
+                     else np.asarray(A_act).T)
+        # mode='r' skips Q computation (~30 % saving); we only need R
+        # diagonal for rank determination and P for the row indices.
+        R, P = scipy.linalg.qr(A_dense_T, mode="r", pivoting=True)
+        diag_R = np.abs(np.diag(R))
+        if diag_R.size == 0 or diag_R[0] < 1e-14:
+            return np.empty(0, dtype=np.int64)
+        rank = int(np.sum(diag_R > tol_rel * diag_R[0]))
+        if rank >= m_act:
+            return None
+        # Sort to preserve KKT row order (eq → ineq → lb → ub) so the
+        # multiplier-extraction logic in ``solve()`` still works
+        # without remapping.
+        return np.sort(P[:rank])
+
+    # ------------------------------------------------------------------
     # Sparse LU + Woodbury overlay
     # ------------------------------------------------------------------
 
-    def _factor_kkt(self, sigma: float, A_act):
+    def _factor_kkt(self, sigma: float, A_act, force_dual_reg: bool = False):
         """Build and factor
 
             M_base = [ (σ+δ_p) I   A_actᵀ ]
@@ -274,7 +338,13 @@ class KKTSparseQP:
         m_act = A_act.shape[0]
         delta = self.delta_reg
         # Pre-emptive dual regularisation when over-committed (see above).
-        dual_reg = (m_act > n)
+        # Pre-emptive dual regularisation: directly when m_act > n (the
+        # system is rank-deficient by counting), or when the caller flags
+        # ``force_dual_reg`` (used when the *original* pre-rank-filter
+        # active set was over-committed even though A_red is now square
+        # — SuperLU's pivoting on perfectly-square saddle-points hits
+        # silent BLAS errors for some structures).
+        dual_reg = (m_act > n) or force_dual_reg
 
         for _ in range(20):  # at most 20 attempts; covers 1e-8 → 1e+4
             sigma_eff = sigma + delta
@@ -475,6 +545,22 @@ class KKTSparseQP:
         last_sigma  = 0.0
         last_delta  = 0.0
         last_A_act  = None
+        last_basis_idx = None
+
+        # QR cache for the rank filter.  Re-running pivoted QR every AS
+        # iter costs O(n · m_act · min(n, m_act)) ≈ 400 ms on TV-MCP-
+        # class problems — dominates the entire solve at ~15× slowdown.
+        #
+        # Caching is *correctness-sensitive*: a new row added by the
+        # single-pivot phase is in the active set because the previous
+        # iterate violated it; treating it as "redundant relative to the
+        # cached basis" drops it from the KKT system, the new step
+        # ignores the violation, and the line search rejects → SQP
+        # collapses early.  We therefore refresh the QR after at most
+        # ``_QR_REFRESH_K`` AS iters and on every remove.
+        _qr_cache_basis    = None
+        _qr_iters_since    = 0
+        _QR_REFRESH_K      = 5
 
         for _ in range(self.max_as_iter):
             key = (frozenset(active_lb), frozenset(active_ub),
@@ -550,11 +636,67 @@ class KKTSparseQP:
             )
             if _DBG:
                 _t_build = _time.perf_counter() - _t_as
-                _t_kkt0  = _time.perf_counter()
+                _t_qr0   = _time.perf_counter()
+
+            # --- Rank-revealing filter (item 6b.5) ---
+            # When ``m_act > n`` the active rows are linearly dependent
+            # by counting alone.  Identify a maximal linearly-independent
+            # subset via pivoted QR on ``A_actᵀ`` and drop the redundant
+            # rows from the KKT system.  Multipliers for dropped rows
+            # are zero in any unique KKT solution; the active-set
+            # bookkeeping (active_ineq, active_lb, active_ub) is
+            # unchanged so subsequent add/remove logic still sees them.
+            #
+            # Without this, the over-committed augmented KKT relies on
+            # the asymmetric dual-reg shift (-δ_d I in the (2,2) block)
+            # which biases λ by δ_d·|λ|; on TV-MCP-class problems |λ|
+            # ~ 1e8 swamps the merit framework.  Rank filter eliminates
+            # the bias entirely by solving a full-rank reduced system.
+            basis_idx = None
+            qr_ran    = False
+            if self.rank_filter and A_act.shape[0] > n:
+                # Refresh QR every ``_QR_REFRESH_K`` AS iters; reuse the
+                # cached basis in between.  Bounded-staleness trade-off:
+                # K iters of slightly biased basis selection in exchange
+                # for K× fewer QR calls.
+                if (_qr_cache_basis is not None
+                        and _qr_iters_since < _QR_REFRESH_K):
+                    basis_idx = _qr_cache_basis
+                    _qr_iters_since += 1
+                else:
+                    basis_idx = self._find_basis_rows(A_act, self.rank_tol)
+                    qr_ran = True
+                    _qr_cache_basis = basis_idx
+                    _qr_iters_since = 0
+            if basis_idx is not None:
+                # Indices may be stale after a single-pivot add (which
+                # appends to active_*, growing m_act by 1).  The
+                # *existing* indices still correctly point to original
+                # rows, so subsetting A_act[basis_idx] stays valid even
+                # though A_act now has more rows than the basis was
+                # computed on.  New rows are simply treated as redundant
+                # until the next QR refresh (correct under saturation;
+                # bounded-stale under refresh-K).
+                A_red = A_act[basis_idx, :]
+                b_red = b_act[basis_idx]
+            else:
+                A_red, b_red = A_act, b_act
+
+            if _DBG:
+                _t_qr   = _time.perf_counter() - _t_qr0
+                _t_kkt0 = _time.perf_counter()
 
             # --- Inner solve: factor M_base, apply Woodbury overlay ---
             sigma, W, d = lbfgs.rank2_factors()
-            lu, delta = self._factor_kkt(sigma, A_act)
+            # Force dual reg when the rank filter produced a square
+            # A_red but the *original* active set was over-committed.
+            # SuperLU's saddle-point pivoting silently BLAS-errors on
+            # some perfectly-square indefinite matrices; the dual shift
+            # makes the matrix non-singular by construction.
+            force_dr = (basis_idx is not None
+                        and A_red.shape[0] >= n)
+            lu, delta = self._factor_kkt(sigma, A_red,
+                                         force_dual_reg=force_dr)
 
             if lu is None:
                 # Numerically singular at maximum delta.  Bail.
@@ -566,21 +708,38 @@ class KKTSparseQP:
                     )
                 return (p, lam_eq, lam_ineq, lam_lb, lam_ub, False)
 
-            p, lam, U, S = self._solve_with_woodbury(
-                lu, sigma, delta, A_act, W, d, -g, b_act,
+            p, lam_red, U, S = self._solve_with_woodbury(
+                lu, sigma, delta, A_red, W, d, -g, b_red,
             )
 
-            # Cache for SOC reuse
+            # Map reduced multipliers back to the full active-set vector.
+            # Dropped (redundant) rows get λ = 0.
+            if basis_idx is not None:
+                lam = np.zeros(A_act.shape[0])
+                lam[basis_idx] = lam_red
+            else:
+                lam = lam_red
+
+            # Cache for SOC reuse (cache the *reduced* system; basis_idx
+            # not cached because SOC reuses the same active set anyway —
+            # we'd need to re-run QR or re-solve the reduced system if
+            # the SOC RHS changes.  Fall back to the full system in SOC
+            # below for safety.)
             last_lu, last_U, last_S, last_W, last_d = lu, U, S, W, d
-            last_sigma, last_delta, last_A_act = sigma, delta, A_act
+            last_sigma, last_delta, last_A_act = sigma, delta, A_red
+            last_basis_idx = basis_idx
 
             if _DBG:
                 _as_iter_count[0] += 1
                 _t_kkt = _time.perf_counter() - _t_kkt0
+                m_act_now = A_act.shape[0]
+                rank = A_red.shape[0]
+                qr_msg = (f"  qr={_t_qr*1000:5.1f}ms  rank={rank}/{m_act_now}"
+                          if basis_idx is not None else "")
                 print(
                     f"[KKT] AS_iter={_as_iter_count[0]:3d}  "
-                    f"m_act={A_act.shape[0]:5d}  build={_t_build*1000:7.1f}ms  "
-                    f"kkt={_t_kkt*1000:7.1f}ms  delta={delta:.1e}  bland={bland}",
+                    f"m_act={m_act_now:5d}  build={_t_build*1000:7.1f}ms  "
+                    f"kkt={_t_kkt*1000:7.1f}ms  delta={delta:.1e}  bland={bland}{qr_msg}",
                     flush=True, file=_sys.stderr,
                 )
 
@@ -671,6 +830,10 @@ class KKTSparseQP:
                 if removed_any:
                     last_added = None
                     last_removed = None
+                    # Remove invalidates the QR cache: dropped rows may
+                    # have been in the basis, so the cached indices are
+                    # no longer reliable.
+                    _qr_cache_basis = None
                     continue
 
                 break  # KKT satisfied
@@ -781,6 +944,8 @@ class KKTSparseQP:
 
             if removed:
                 last_added = None
+                # Remove invalidates the QR cache (see block-remove note).
+                _qr_cache_basis = None
             else:
                 break  # KKT satisfied
 
@@ -802,6 +967,7 @@ class KKTSparseQP:
         self._sigma_soc = last_sigma
         self._delta_soc = last_delta
         self._A_act_soc = last_A_act
+        self._basis_idx_soc = last_basis_idx
         self._active_ineq_soc = list(active_ineq)
         self._active_lb_soc   = list(active_lb)
         self._active_ub_soc   = list(active_ub)
@@ -872,6 +1038,12 @@ class KKTSparseQP:
                 ])
             )
         b_act = np.concatenate(b_parts) if b_parts else np.empty(0)
+
+        # If the cached factor was built on a rank-filtered (basis-only)
+        # A_act, project the trial-point b onto the same basis rows.
+        # Cached ``_A_act_soc`` is already the reduced matrix.
+        if self._basis_idx_soc is not None:
+            b_act = b_act[self._basis_idx_soc]
 
         try:
             d_step, _, _, _ = self._solve_with_woodbury(

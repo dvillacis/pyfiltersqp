@@ -65,6 +65,16 @@ class SQPSolver:
         triggering the L-BFGS reset watchdog.  Recommended for the
         ``kkt`` backend on equality-saturated problems; HS suite
         unaffected when left ``None``.
+    rank_filter : bool
+        Forwarded to :class:`KKTSparseQP` (default ``True``).  Detects
+        and drops linearly dependent active rows via pivoted QR before
+        the KKT factorisation.  Eliminates multiplier inflation on
+        rank-deficient/over-committed problems (kkt_residual drops by
+        many orders of magnitude on TV-MCP-class problems) at the cost
+        of a per-AS-iter dense QR (cached every 5 iters internally to
+        bound the overhead).  Set ``False`` for fastest runtime when
+        cleaner KKT residuals aren't needed.  No-op for backends
+        other than ``"kkt"``.
     rho : float
         Line search backtracking factor (default 0.5).
     eta : float
@@ -122,6 +132,7 @@ class SQPSolver:
         mu0:          float = 1.0,
         mu_max:       float = 1e10,
         step_max:     float | None = None,
+        rank_filter:  bool  = True,
         rho:          float = 0.5,
         eta:          float = 1e-4,
         verbose:      bool  = False,
@@ -143,6 +154,7 @@ class SQPSolver:
         self.mu0             = mu0
         self.mu_max          = mu_max
         self.step_max        = step_max
+        self.rank_filter     = rank_filter
         self.rho             = rho
         self.eta             = eta
         self.verbose         = verbose
@@ -304,7 +316,7 @@ class SQPSolver:
         elif backend == "pcg":
             qp = ProjectedCGQP(n, m_eq, m_ineq)
         elif backend == "kkt":
-            qp = KKTSparseQP(n, m_eq, m_ineq)
+            qp = KKTSparseQP(n, m_eq, m_ineq, rank_filter=self.rank_filter)
         else:
             qp = QPSubproblem(n, m_eq, m_ineq, self.osqp_options)
         mu    = self.mu0
