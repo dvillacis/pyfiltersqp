@@ -643,14 +643,70 @@ class SQPSolver:
                             filt.add(f, h_curr)
 
                 if alpha <= 1e-10:
+                    # Last-resort feasibility restoration: l₁ merit + SOC +
+                    # filter fallback all refused the QP step.  Mirror of
+                    # the restoration logic in the use_filter_local branch
+                    # above and the qp_ok=False path: take a steepest-descent
+                    # step on h = ‖c_eq‖₁ + ‖max(0,c_ineq)‖₁ until the
+                    # violation strictly decreases, then restart the SQP
+                    # iteration from the restored point.  Particularly
+                    # useful for KKT-backed solves where a watchdog-exit
+                    # best-effort step can violate every line-search
+                    # criterion despite KKT progress in earlier iters.
+                    if resto_count < 5:
+                        h_curr = constraint_violation(c_eq, c_ineq)
+                        h_grad = np.zeros(n)
+                        if m_eq > 0 and J_eq is not None:
+                            h_grad += np.asarray(J_eq.T @ np.sign(c_eq)).ravel()
+                        if m_ineq > 0 and J_ineq is not None:
+                            active = c_ineq > 0
+                            if active.any():
+                                idx = np.where(active)[0]
+                                if sp.issparse(J_ineq):
+                                    h_grad += np.asarray(J_ineq[idx, :].sum(axis=0)).ravel()
+                                else:
+                                    h_grad += J_ineq[idx].T @ np.ones(len(idx))
+                        h_grad_norm = np.linalg.norm(h_grad)
+                        restored = False
+                        if h_grad_norm > 1e-14:
+                            rest_dir = -h_grad / h_grad_norm
+                            alpha_r = 1.0
+                            for _ in range(self.max_ls_iter):
+                                x_r = np.clip(x + alpha_r * rest_dir, p.xl, p.xu)
+                                c_eq_r   = (np.asarray(p.eq_constraints(x_r))
+                                            if m_eq   > 0 else np.empty(0))
+                                c_ineq_r = (np.asarray(p.ineq_constraints(x_r))
+                                            if m_ineq > 0 else np.empty(0))
+                                if (constraint_violation(c_eq_r, c_ineq_r)
+                                        < (1.0 - 1e-4) * h_curr):
+                                    x = x_r
+                                    f, g, c_eq, J_eq, c_ineq, J_ineq = _eval(x)
+                                    restored = True
+                                    break
+                                alpha_r *= 0.5
+                        if restored:
+                            resto_count += 1
+                            if __import__("os").environ.get("PYFILTERSQP_DEBUG"):
+                                import sys as _sys
+                                h_after = constraint_violation(c_eq, c_ineq)
+                                print(
+                                    f"[PYFSQP] RESTORATION  iter={k}  "
+                                    f"h {h_curr:.2e} → {h_after:.2e}  "
+                                    f"alpha_r={alpha_r:.2e}  "
+                                    f"resto_count={resto_count}",
+                                    flush=True, file=_sys.stderr,
+                                )
+                            continue   # restart SQP iteration from restored x
+
                     if __import__("os").environ.get("PYFILTERSQP_DEBUG"):
                         import sys as _sys
                         h_now = constraint_violation(c_eq, c_ineq)
                         print(
                             f"[PYFSQP] LINE-SEARCH-FAIL  iter={k}  "
-                            f"l1+SOC+filter all refused  alpha<=1e-10  "
+                            f"l1+SOC+filter+resto all refused  alpha<=1e-10  "
                             f"|step|={float(np.linalg.norm(step)):.2e}  "
-                            f"f={f:.4e}  h={h_now:.2e}  mu={mu:.2e}",
+                            f"f={f:.4e}  h={h_now:.2e}  mu={mu:.2e}  "
+                            f"resto_count={resto_count}",
                             flush=True, file=_sys.stderr,
                         )
                     return self._make_result(x, f, lam_eq_new, lam_ineq_new,
