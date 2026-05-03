@@ -75,6 +75,35 @@ class SQPSolver:
         bound the overhead).  Set ``False`` for fastest runtime when
         cleaner KKT residuals aren't needed.  No-op for backends
         other than ``"kkt"``.
+    trust_region : bool
+        Replace the l₁-merit / filter line search with a trust-region
+        outer loop (default ``False``).  At each iter the QP step is
+        bounded by ``‖p‖∞ ≤ Δ`` (added to the variable bounds), the
+        actual-vs-predicted reduction ratio ``ρ`` is computed against
+        the l₁-merit model, and Δ is grown/shrunk based on ρ.  Step
+        accepted iff ``ρ > tr_eta_acc``.  Useful when the line search
+        rejects every QP step at saturated active sets (TV-MCP-class
+        problems where the watchdog-exit step isn't a monotone-merit
+        descent direction): TR can accept it when ρ is large enough
+        even if the merit hasn't decreased monotonically along the
+        line ``α·p``.
+    tr_delta0 : float
+        Initial trust-region radius (default 10.0).
+    tr_delta_min : float
+        Minimum trust-region radius before declaring failure
+        (default 1e-8).
+    tr_delta_max : float
+        Maximum trust-region radius (default 1e6).
+    tr_eta_acc : float
+        Acceptance threshold on the actual/predicted reduction ratio
+        (default 0.1).  Steps with ``ρ > tr_eta_acc`` are accepted.
+    tr_eta_grow : float
+        Growth threshold (default 0.75).  When ``ρ > tr_eta_grow`` and
+        the step was at the TR boundary, Δ grows by ``tr_grow`` factor.
+    tr_grow : float
+        Δ growth factor on highly-successful iters (default 2.0).
+    tr_shrink : float
+        Δ shrink factor on rejected iters (default 0.25).
     rho : float
         Line search backtracking factor (default 0.5).
     eta : float
@@ -133,6 +162,14 @@ class SQPSolver:
         mu_max:       float = 1e10,
         step_max:     float | None = None,
         rank_filter:  bool  = True,
+        trust_region: bool  = False,
+        tr_delta0:    float = 10.0,
+        tr_delta_min: float = 1e-8,
+        tr_delta_max: float = 1e6,
+        tr_eta_acc:   float = 0.1,
+        tr_eta_grow:  float = 0.75,
+        tr_grow:      float = 2.0,
+        tr_shrink:    float = 0.25,
         rho:          float = 0.5,
         eta:          float = 1e-4,
         verbose:      bool  = False,
@@ -155,6 +192,14 @@ class SQPSolver:
         self.mu_max          = mu_max
         self.step_max        = step_max
         self.rank_filter     = rank_filter
+        self.trust_region    = trust_region
+        self.tr_delta0       = tr_delta0
+        self.tr_delta_min    = tr_delta_min
+        self.tr_delta_max    = tr_delta_max
+        self.tr_eta_acc      = tr_eta_acc
+        self.tr_eta_grow     = tr_eta_grow
+        self.tr_grow         = tr_grow
+        self.tr_shrink       = tr_shrink
         self.rho             = rho
         self.eta             = eta
         self.verbose         = verbose
@@ -281,6 +326,9 @@ class SQPSolver:
         -------
         SQPResult
         """
+        if self.trust_region:
+            return self._solve_trust_region(problem, x0, lam_eq0, lam_ineq0)
+
         p = problem
         n, m_eq, m_ineq = p.n, p.m_eq, p.m_ineq
 
@@ -786,6 +834,243 @@ class SQPSolver:
             lam_lb, lam_ub   = lam_lb_new, lam_ub_new
 
         return self._make_result(x, f, lam_eq, lam_ineq, lam_lb, lam_ub, problem, 1, self.max_iter, history)
+
+    # ------------------------------------------------------------------
+    # Trust-region outer loop
+    # ------------------------------------------------------------------
+
+    def _solve_trust_region(
+        self,
+        problem: NLPProblem,
+        x0: np.ndarray,
+        lam_eq0:   np.ndarray | None = None,
+        lam_ineq0: np.ndarray | None = None,
+    ) -> SQPResult:
+        """Trust-region SQP outer loop with l₁-merit acceptance test.
+
+        Replaces the line-search path entirely.  At each iter the QP
+        step is bounded via ``-Δ ≤ p ≤ +Δ`` (intersected with the
+        problem bounds), the trial point's actual reduction in the
+        l₁ merit is compared to the QP-model's predicted reduction,
+        and ``Δ`` is grown / shrunk based on the ratio ``ρ``.  Steps
+        with ``ρ > tr_eta_acc`` are accepted; lower ρ triggers a
+        shrink-and-resolve cycle until either acceptance or
+        ``Δ < tr_delta_min`` (failure).
+
+        Useful when the line search rejects every QP step at saturated
+        active sets — TR can accept a step on the basis of model
+        agreement (ρ) even when the merit hasn't decreased monotonically
+        along ``α·p``.  See class docstring for the parameter list.
+        """
+        import os as _os
+        import sys as _sys
+
+        p = problem
+        n, m_eq, m_ineq = p.n, p.m_eq, p.m_ineq
+
+        x       = np.asarray(x0, dtype=float).copy()
+        lam_eq  = np.zeros(m_eq)  if lam_eq0  is None else np.asarray(lam_eq0,  dtype=float).copy()
+        lam_ineq = np.zeros(m_ineq) if lam_ineq0 is None else np.asarray(lam_ineq0, dtype=float).copy()
+
+        backend = self.backend
+        if backend == "auto":
+            backend = self._select_auto_backend(p)
+            self.use_implicit_qp   = (backend == "implicit")
+            self.use_woodbury_admm = (backend == "woodbury")
+
+        lbfgs = LBFGSMemory(n, memory=self.lbfgs_memory)
+        if backend == "woodbury":
+            qp = WoodburyADMM(n, m_eq, m_ineq)
+        elif backend == "implicit":
+            qp = ImplicitLBFGSQP(n, m_eq, m_ineq)
+        elif backend == "pcg":
+            qp = ProjectedCGQP(n, m_eq, m_ineq)
+        elif backend == "kkt":
+            qp = KKTSparseQP(n, m_eq, m_ineq, rank_filter=self.rank_filter)
+        else:
+            qp = QPSubproblem(n, m_eq, m_ineq, self.osqp_options)
+
+        mu     = self.mu0
+        delta  = self.tr_delta0
+        history: list[IterationInfo] = []
+        lam_lb = np.zeros(n)
+        lam_ub = np.zeros(n)
+
+        # Helper closures (mirror the line-search path)
+        def _eval(x):
+            f = float(p.objective(x))
+            g = np.asarray(p.gradient(x), dtype=float)
+            if m_eq > 0:
+                c_eq = np.asarray(p.eq_constraints(x), dtype=float)
+                J_raw = p.eq_jacobian(x)
+                J_eq = J_raw if sp.issparse(J_raw) else np.asarray(J_raw, dtype=float)
+            else:
+                c_eq, J_eq = np.empty(0), None
+            if m_ineq > 0:
+                c_ineq = np.asarray(p.ineq_constraints(x), dtype=float)
+                J_raw = p.ineq_jacobian(x)
+                J_ineq = J_raw if sp.issparse(J_raw) else np.asarray(J_raw, dtype=float)
+            else:
+                c_ineq, J_ineq = np.empty(0), None
+            return f, g, c_eq, J_eq, c_ineq, J_ineq
+
+        def _grad_lag(g, J_eq, J_ineq, lam_eq, lam_ineq):
+            gl = g.copy()
+            if J_eq   is not None: gl += np.asarray(J_eq.T   @ lam_eq).ravel()
+            if J_ineq is not None: gl += np.asarray(J_ineq.T @ lam_ineq).ravel()
+            return gl
+
+        f, g, c_eq, J_eq, c_ineq, J_ineq = _eval(x)
+        h_curr = constraint_violation(c_eq, c_ineq)
+
+        # Gradient-aware H₀ init (same as line-search path)
+        g_inf = float(np.max(np.abs(g))) if g.size > 0 else 1.0
+        if g_inf > 1e4:
+            lbfgs._scale = 1.0 / g_inf
+
+        _DBG = bool(_os.environ.get("PYFILTERSQP_DEBUG"))
+        if self.verbose or _DBG:
+            print(
+                f"  pyfsqp-TR ENTER  backend={backend}  n={n}  m_eq={m_eq}  "
+                f"m_ineq={m_ineq}  Δ₀={delta:.2e}  ‖g0‖∞={g_inf:.2e}",
+                flush=True,
+            )
+
+        for k in range(self.max_iter):
+            # 1. Build TR-clipped variable bounds: xl ≤ x+p ≤ xu and ‖p‖∞ ≤ Δ
+            xl_tr = np.maximum(p.xl, x - delta)
+            xu_tr = np.minimum(p.xu, x + delta)
+
+            # 2. Solve the QP with TR bounds
+            if backend in ("woodbury", "implicit", "pcg", "kkt"):
+                step, lam_eq_new, lam_ineq_new, lam_lb_new, lam_ub_new, qp_ok = qp.solve(
+                    lbfgs, g, c_eq, J_eq, c_ineq, J_ineq, x, xl_tr, xu_tr
+                )
+            else:
+                B_dense = lbfgs.materialise()
+                step, lam_eq_new, lam_ineq_new, lam_lb_new, lam_ub_new, qp_ok = qp.solve(
+                    B_dense, g, c_eq, J_eq, c_ineq, J_ineq, x, xl_tr, xu_tr
+                )
+
+            # Step-size cap stays compatible with TR (caps the QP step independently)
+            if qp_ok and self.step_max is not None and step.size > 0:
+                step_inf = float(np.max(np.abs(step)))
+                if step_inf > self.step_max:
+                    step = step * (self.step_max / step_inf)
+
+            if not qp_ok:
+                # QP infeasible at this Δ — shrink and retry
+                delta *= self.tr_shrink
+                if _DBG:
+                    print(f"[PYFSQP-TR] iter={k}  qp_ok=False  shrink Δ→{delta:.2e}",
+                          flush=True, file=_sys.stderr)
+                if delta < self.tr_delta_min:
+                    return self._make_result(x, f, lam_eq, lam_ineq, lam_lb, lam_ub,
+                                             problem, 3, k, history)
+                continue
+
+            # 3. Convergence check (KKT)
+            kkt = kkt_residuals(g, c_eq, c_ineq, J_eq, J_ineq,
+                                lam_eq_new, lam_ineq_new, lam_lb_new, lam_ub_new)
+            if kkt.satisfied(self.tol_feas, self.tol_opt, self.tol_comp):
+                return self._make_result(x, f, lam_eq_new, lam_ineq_new,
+                                         lam_lb_new, lam_ub_new, problem, 0, k, history)
+
+            # 4. Compute trial point + actual / predicted reduction
+            x_trial      = x + step
+            f_trial      = float(p.objective(x_trial))
+            c_eq_trial   = (np.asarray(p.eq_constraints(x_trial))
+                            if m_eq   > 0 else np.empty(0))
+            c_ineq_trial = (np.asarray(p.ineq_constraints(x_trial))
+                            if m_ineq > 0 else np.empty(0))
+            h_trial = constraint_violation(c_eq_trial, c_ineq_trial)
+
+            # Linearised constraint violation along p
+            c_eq_lin   = (c_eq   + np.asarray(J_eq   @ step).ravel()
+                          if J_eq   is not None else c_eq)
+            c_ineq_lin = (c_ineq + np.asarray(J_ineq @ step).ravel()
+                          if J_ineq is not None else c_ineq)
+            h_lin = constraint_violation(c_eq_lin, c_ineq_lin)
+
+            # Quadratic-model reductions
+            Bp  = lbfgs.matvec(step)
+            gp  = float(g @ step)
+            pBp = float(step @ Bp)
+
+            # Update mu so the predicted reduction is positive (l₁ merit
+            # descent condition); same logic as `update_penalty`.
+            h_red_lin = h_curr - h_lin
+            if h_red_lin > 1e-14:
+                sigma_mu = 0.01
+                mu_thresh = (gp + 0.5 * pBp) / ((1.0 - sigma_mu) * h_red_lin)
+                if mu < mu_thresh:
+                    mu = mu_thresh * 1.1
+                if self.mu_max is not None and mu > self.mu_max:
+                    mu = self.mu_max
+
+            pred_red   = -gp - 0.5 * pBp + mu * h_red_lin
+            actual_red = (f - f_trial) + mu * (h_curr - h_trial)
+
+            if pred_red > 1e-14:
+                rho = actual_red / pred_red
+            else:
+                rho = -1.0   # bad model — force shrink
+
+            if self.verbose or _DBG:
+                step_inf = float(np.max(np.abs(step))) if step.size > 0 else 0.0
+                print(
+                    f"  pyfsqp-TR iter={k:4d}  Δ={delta:.2e}  ρ={rho:+.3f}  "
+                    f"f={f:+.4e}→{f_trial:+.4e}  h={h_curr:.2e}→{h_trial:.2e}  "
+                    f"|p|∞={step_inf:.2e}  μ={mu:.2e}",
+                    flush=True,
+                )
+
+            if rho > self.tr_eta_acc:
+                # Accept step
+                gl_old = _grad_lag(g,         J_eq, J_ineq, lam_eq_new, lam_ineq_new)
+                f_new, g_new, c_eq_new, J_eq_new, c_ineq_new, J_ineq_new = _eval(x_trial)
+                gl_new = _grad_lag(g_new, J_eq_new, J_ineq_new, lam_eq_new, lam_ineq_new)
+                lbfgs.update(x_trial - x, gl_new - gl_old)
+
+                x       = x_trial
+                f       = f_new
+                g       = g_new
+                c_eq    = c_eq_new
+                J_eq    = J_eq_new
+                c_ineq  = c_ineq_new
+                J_ineq  = J_ineq_new
+                h_curr  = h_trial
+                lam_eq, lam_ineq = lam_eq_new, lam_ineq_new
+                lam_lb, lam_ub   = lam_lb_new, lam_ub_new
+
+                # Grow Δ on highly-successful steps that hit the TR boundary
+                step_inf = float(np.max(np.abs(step))) if step.size > 0 else 0.0
+                if rho > self.tr_eta_grow and step_inf > 0.5 * delta:
+                    delta = min(delta * self.tr_grow, self.tr_delta_max)
+
+                if self.verbose:
+                    history.append(IterationInfo(
+                        iteration=k, obj=f,
+                        primal_eq=kkt.primal_eq,
+                        primal_ineq=kkt.primal_ineq,
+                        dual=kkt.dual,
+                        compl=kkt.compl,
+                        step_norm=float(np.linalg.norm(step)),
+                        step_size=1.0,   # TR steps are full-length
+                        qp_iters=0,
+                    ))
+            else:
+                # Reject: shrink Δ, keep x, retry next iter
+                delta *= self.tr_shrink
+                if delta < self.tr_delta_min:
+                    if _DBG:
+                        print(f"[PYFSQP-TR] Δ collapsed to {delta:.2e} < {self.tr_delta_min}; "
+                              f"declaring line-search failure", flush=True, file=_sys.stderr)
+                    return self._make_result(x, f, lam_eq_new, lam_ineq_new,
+                                             lam_lb_new, lam_ub_new, problem, 2, k, history)
+
+        return self._make_result(x, f, lam_eq, lam_ineq, lam_lb, lam_ub,
+                                 problem, 1, self.max_iter, history)
 
     @staticmethod
     def _make_result(x, f, lam_eq, lam_ineq, lam_lb, lam_ub, problem, status, iterations, history):
